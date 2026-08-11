@@ -1,7 +1,3 @@
-Exit code: 0
-Wall time: 1.2 seconds
-Total output lines: 2793
-Output:
 // ==UserScript==
 // @name         bilibili类原生查看对话
 // @namespace    https://github.com/nsdd/bilibili-native-dialog
