@@ -1,5 +1,5 @@
 Exit code: 0
-Wall time: 1 seconds
+Wall time: 1.2 seconds
 Total output lines: 2793
 Output:
 // ==UserScript==
