@@ -1,6 +1,3 @@
-Exit code: 0
-Wall time: 1 seconds
-Output:
 # bilibili类原生查看对话
 
 当前脚本版本：`0.5.2`
