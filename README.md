@@ -4,7 +4,7 @@
 
 让 B 站网页端也能像客户端一样查看完整的评论对话。
 
-[![直接安装](https://img.shields.io/badge/%E7%9B%B4%E6%8E%A5%E5%AE%89%E8%A3%85-%E7%82%B9%E5%87%BB%E5%AE%89%E8%A3%85-00A1D6?style=for-the-badge&logo=tampermonkey&logoColor=white)](https://github.com/luolisama/bilibili-native-dialog/raw/refs/heads/main/bilibili-native-dialog.min.user.js?download=1)
+[![直接安装未压缩版](https://img.shields.io/badge/%E7%9B%B4%E6%8E%A5%E5%AE%89%E8%A3%85-%E6%9C%AA%E5%8E%8B%E7%BC%A9%E7%89%88-00A1D6?style=for-the-badge&logo=tampermonkey&logoColor=white)](https://github.com/luolisama/bilibili-native-dialog/raw/refs/heads/main/bilibili-native-dialog.user.js?download=1)
 
 <sub>点击上方按钮后，用户脚本管理器会自动打开安装页面。</sub>
 
@@ -19,17 +19,11 @@
 ## 安装
 
 1. 先安装 Tampermonkey 或 Violentmonkey。
-2. 点击页面顶部的「直接安装」按钮（推荐压缩版）。
+2. 点击页面顶部的「直接安装未压缩版」按钮。
 3. 在弹出的用户脚本页面中点击「安装」或「确认安装」。
 4. 打开或刷新 B 站页面即可生效。
 
-也可以选择下面的未压缩版查看源代码：
-
-| Github min（推荐） | Github |
-| --- | --- |
-| [安装压缩版](https://github.com/luolisama/bilibili-native-dialog/raw/refs/heads/main/bilibili-native-dialog.min.user.js?download=1) | [安装未压缩版](https://github.com/luolisama/bilibili-native-dialog/raw/refs/heads/main/bilibili-native-dialog.user.js?download=1) |
-
-如果之前安装过旧版，建议先在用户脚本管理器中删除旧版，再安装压缩版。
+本项目只提供 GitHub 未压缩版安装入口。如果之前安装过旧版，建议先在用户脚本管理器中删除旧版，再安装当前版本。
 
 ## 怎么使用
 
@@ -52,6 +46,6 @@
 
 <div align="center">
 
-[⬇️ 再次安装](https://github.com/luolisama/bilibili-native-dialog/raw/refs/heads/main/bilibili-native-dialog.min.user.js?download=1) · [查看源代码](https://github.com/luolisama/bilibili-native-dialog/blob/main/bilibili-native-dialog.user.js)
+[⬇️ 安装未压缩版](https://github.com/luolisama/bilibili-native-dialog/raw/refs/heads/main/bilibili-native-dialog.user.js?download=1) · [查看源代码](https://github.com/luolisama/bilibili-native-dialog/blob/main/bilibili-native-dialog.user.js)
 
 </div>
