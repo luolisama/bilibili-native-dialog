@@ -2,6 +2,7 @@
 // @name         bilibili类原生查看对话
 // @namespace    https://github.com/nsdd/bilibili-native-dialog
 // @version      0.5.2
+// @author       luolisama
 // @description  在 B 站原生楼中楼操作栏中添加同风格的“查看对话”，并提供评论区式互动、表情和原生风格 @ 回复。
 // @match        https://www.bilibili.com/*
 // @match        https://bilibili.com/*
