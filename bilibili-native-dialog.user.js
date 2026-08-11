@@ -2,6 +2,7 @@
 // @name         bilibili类原生查看对话
 // @namespace    https://github.com/nsdd/bilibili-native-dialog
 // @version      0.5.2
+// @author       luolisama
 // @description  在 B 站原生楼中楼操作栏中添加同风格的“查看对话”，并提供评论区式互动、表情和原生风格 @ 回复。
 // @match        https://www.bilibili.com/*
 // @match        https://bilibili.com/*
@@ -590,8 +591,7 @@
                 grid-template-columns: 40px minmax(0, 1fr);
                 gap: 10px;
                 padding: 14px 0;
-                border-bottom: 1px solid #f1f2f3;
-       …17267 tokens truncated…og-avatar';
+                border-bottom:…17274 tokens truncated…og-avatar';
             avatar.alt = safeString(reply.member?.uname) || '用户头像';
             avatar.loading = 'lazy';
             const avatarUrl = toSafeUrl(reply.member?.avatar || reply.member?.face);
