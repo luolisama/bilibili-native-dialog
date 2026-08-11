@@ -3,8 +3,8 @@
 // @namespace    https://github.com/nsdd/bilibili-native-dialog
 // @version      0.5.3
 // @author       luolisama
-// @downloadURL  https://raw.githubusercontent.com/luolisama/bilibili-native-dialog/main/bilibili-native-dialog.user.js
-// @updateURL    https://raw.githubusercontent.com/luolisama/bilibili-native-dialog/main/bilibili-native-dialog.user.js
+// @downloadURL  https://raw.githubusercontent.com/luolisama/bilibili-native-dialog/main/bilibili-native-dialog.user.js?v=0.5.3
+// @updateURL    https://raw.githubusercontent.com/luolisama/bilibili-native-dialog/main/bilibili-native-dialog.user.js?v=0.5.3
 // @description  在 B 站原生楼中楼操作栏中添加同风格的“查看对话”，并提供评论区式互动、表情和原生风格 @ 回复。
 // @match        https://www.bilibili.com/*
 // @match        https://bilibili.com/*
@@ -586,7 +586,7 @@
                 padding: 28px 8px;
                 color: #9499a0;
                 text-align: center;
-                fon…17334 tokens truncated…og-avatar';
+   …17338 tokens truncated…og-avatar';
             avatar.alt = safeString(reply.member?.uname) || '用户头像';
             avatar.loading = 'lazy';
             const avatarUrl = toSafeUrl(reply.member?.avatar || reply.member?.face);
