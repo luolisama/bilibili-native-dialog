@@ -4,7 +4,7 @@
 
 让 B 站网页端也能像客户端一样查看完整的评论对话。
 
-[![直接安装](https://img.shields.io/badge/%E7%9B%B4%E6%8E%A5%E5%AE%89%E8%A3%85-%E7%82%B9%E5%87%BB%E5%AE%89%E8%A3%85-00A1D6?style=for-the-badge&logo=tampermonkey&logoColor=white)](https://raw.githubusercontent.com/luolisama/bilibili-native-dialog/main/bilibili-native-dialog.user.js)
+[![直接安装](https://img.shields.io/badge/%E7%9B%B4%E6%8E%A5%E5%AE%89%E8%A3%85-%E7%82%B9%E5%87%BB%E5%AE%89%E8%A3%85-00A1D6?style=for-the-badge&logo=tampermonkey&logoColor=white)](https://raw.githubusercontent.com/luolisama/bilibili-native-dialog/main/bilibili-native-dialog.user.js?v=0.5.3)
 
 <sub>点击上方按钮后，用户脚本管理器会自动打开安装页面。</sub>
 
@@ -44,6 +44,6 @@
 
 <div align="center">
 
-[⬇️ 再次安装](https://raw.githubusercontent.com/luolisama/bilibili-native-dialog/main/bilibili-native-dialog.user.js) · [查看源代码](https://github.com/luolisama/bilibili-native-dialog/blob/main/bilibili-native-dialog.user.js)
+[⬇️ 再次安装](https://raw.githubusercontent.com/luolisama/bilibili-native-dialog/main/bilibili-native-dialog.user.js?v=0.5.3) · [查看源代码](https://github.com/luolisama/bilibili-native-dialog/blob/main/bilibili-native-dialog.user.js)
 
 </div>
