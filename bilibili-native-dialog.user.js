@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         bilibili类原生查看对话
 // @namespace    https://github.com/nsdd/bilibili-native-dialog
-// @version      0.5.5
+// @version      0.5.6
 // @author       luolisama
 // @downloadURL  https://github.com/luolisama/bilibili-native-dialog/raw/refs/heads/main/bilibili-native-dialog.user.js?download=1
 // @updateURL    https://github.com/luolisama/bilibili-native-dialog/raw/refs/heads/main/bilibili-native-dialog.user.js?download=1
@@ -19,14 +19,15 @@
     'use strict';
 
     const CONFIG = Object.freeze({
-        pageType: '1',
         pageSize: 20,
         maxPages: 100,
         cacheTtlMs: 3 * 60 * 1000,
         scanDebounceMs: 180,
-        scanIntervalMs: 1800,
+        scanIntervalMs: 5000,
         requestTimeoutMs: 15000,
-        apiBase: 'https://api.bilibili.com'
+        apiBase: 'https://api.bilibili.com',
+        maxDialogCacheEntries: 24,
+        maxPageMentionCandidates: 300
     });
 
     const COMMENT_TYPES = new Set(['1', '11', '12', '17']);
@@ -42,10 +43,11 @@
     const state = {
         observedRoots: new WeakSet(),
         styledRoots: new WeakSet(),
-        rootObservers: new WeakMap(),
         scanTimer: null,
         scanInterval: null,
         scanning: false,
+        pendingScanNodes: new Set(),
+        fullScanPending: false,
         routeKey: location.href,
         dialogCache: new Map(),
         activePanel: null,
@@ -61,12 +63,6 @@
 
     const GLOBAL_STYLE_ID = 'bdv-global-style';
     const LINK_CLASS = 'bdv-view-dialog';
-
-    function log(level, ...args) {
-        if (level === 'error') {
-            console.error('[bilibili类原生查看对话]', ...args);
-        }
-    }
 
     function isObject(value) {
         return value !== null && typeof value === 'object';
@@ -176,6 +172,12 @@
         return COMMENT_TYPES.has(type) ? type : '';
     }
 
+    function requireCommentType(info) {
+        const type = normalizeCommentType(info?.type);
+        if (!type) throw new Error('无法识别当前页面的评论类型');
+        return type;
+    }
+
     function getPageContext() {
         const pathname = safeString(location.pathname);
         const hostname = safeString(location.hostname).toLowerCase();
@@ -277,8 +279,7 @@
             readId(raw, 'type'),
             readId(raw, 'comment_type'),
             raw.commentType,
-            fallbackType,
-            CONFIG.pageType
+            fallbackType
         );
         const member = isObject(raw.member) ? raw.member : {};
         const content = isObject(raw.content) ? raw.content : {};
@@ -299,8 +300,7 @@
             action,
             member,
             content,
-            location: firstString(control.location, raw.location),
-            raw
+            location: firstString(control.location, raw.location)
         };
     }
 
@@ -375,8 +375,16 @@
     }
 
     function ensureShadowStyles(root) {
-        if (!root || state.styledRoots.has(root)) return;
-        state.styledRoots.add(root);
+        if (!root) return;
+
+        // B 站可能在复用同一个 ShadowRoot 时重建子节点。不能只依赖
+        // WeakSet 标记，否则样式节点被清掉后不会再注入。
+        const existingStyle = root.querySelector?.('style[data-bdv-style="true"]');
+        if (existingStyle) {
+            state.styledRoots.add(root);
+            return;
+        }
+        state.styledRoots.delete(root);
 
         const style = document.createElement('style');
         style.setAttribute('data-bdv-style', 'true');
@@ -409,6 +417,7 @@
         `;
         try {
             root.appendChild(style);
+            state.styledRoots.add(root);
         } catch (_) {
             state.styledRoots.delete(root);
         }
@@ -439,7 +448,7 @@
     }
 
     function insertDialogLink(host, info) {
-        if (!info || !info.rpid || !info.root || info.root === '0') return;
+        if (!info || !info.rpid || !info.root || info.root === '0' || !info.type) return;
         if (!info.dialog || info.dialog === '0' || info.dialog === info.rpid) return;
 
         const shadowRoot = host.shadowRoot;
@@ -468,45 +477,108 @@
         insertDialogLink(host, info);
     }
 
+    function isScanNode(node) {
+        return node && (
+            node.nodeType === Node.ELEMENT_NODE
+            || node.nodeType === Node.DOCUMENT_FRAGMENT_NODE
+            || node.nodeType === Node.DOCUMENT_NODE
+        );
+    }
+
+    function queueScanNode(node) {
+        if (isScanNode(node)) state.pendingScanNodes.add(node);
+    }
+
+    function scheduleScan(nodes = []) {
+        for (const node of nodes) queueScanNode(node);
+        if (state.scanTimer) return;
+        state.scanTimer = window.setTimeout(() => {
+            state.scanTimer = null;
+            scan();
+        }, CONFIG.scanDebounceMs);
+    }
+
+    function scheduleFullScan() {
+        state.fullScanPending = true;
+        scheduleScan();
+    }
+
+    function handleMutationRecords(records) {
+        const nodes = [];
+        let hasUsefulNode = false;
+
+        for (const record of records || []) {
+            if (record.type !== 'childList') continue;
+
+            if (record.target?.nodeType !== Node.DOCUMENT_NODE) {
+                nodes.push(record.target);
+            }
+            for (const node of record.addedNodes || []) {
+                if (isScanNode(node)) {
+                    nodes.push(node);
+                    hasUsefulNode = true;
+                }
+            }
+        }
+
+        if (nodes.length || hasUsefulNode) {
+            scheduleScan(nodes);
+        } else if ((records || []).length) {
+            // 兜底处理没有可定位 addedNode 的页面重建。
+            scheduleFullScan();
+        }
+    }
+
     function observeRoot(root) {
         if (!root || state.observedRoots.has(root)) return;
         state.observedRoots.add(root);
 
-        const observer = new MutationObserver(() => scheduleScan());
+        const observer = new MutationObserver(handleMutationRecords);
         try {
             observer.observe(root, { childList: true, subtree: true });
-            state.rootObservers.set(root, observer);
         } catch (_) {
             state.observedRoots.delete(root);
+        }
+    }
+
+    function visitNode(node) {
+        if (!isScanNode(node)) return;
+
+        if (node.nodeType === Node.ELEMENT_NODE) {
+            if (isReplyHost(node)) processReplyHost(node);
+            if (node.shadowRoot) visitRoot(node.shadowRoot);
+        }
+
+        if (!node.querySelectorAll) return;
+        for (const element of node.querySelectorAll('*')) {
+            if (isReplyHost(element)) processReplyHost(element);
+            if (element.shadowRoot) visitRoot(element.shadowRoot);
         }
     }
 
     function visitRoot(root) {
         if (!root?.querySelectorAll) return;
         observeRoot(root);
-
-        for (const element of root.querySelectorAll('*')) {
-            if (isReplyHost(element)) processReplyHost(element);
-            if (element.shadowRoot) visitRoot(element.shadowRoot);
-        }
+        visitNode(root);
     }
 
     function scan() {
         if (state.scanning) return;
         state.scanning = true;
         try {
-            visitRoot(document);
+            if (state.fullScanPending) {
+                state.fullScanPending = false;
+                state.pendingScanNodes.clear();
+                visitRoot(document);
+                return;
+            }
+
+            const nodes = [...state.pendingScanNodes];
+            state.pendingScanNodes.clear();
+            for (const node of nodes) visitNode(node);
         } finally {
             state.scanning = false;
         }
-    }
-
-    function scheduleScan() {
-        if (state.scanTimer) return;
-        state.scanTimer = window.setTimeout(() => {
-            state.scanTimer = null;
-            scan();
-        }, CONFIG.scanDebounceMs);
     }
 
     function ensureGlobalStyles() {
@@ -1248,7 +1320,11 @@
             return;
         }
 
-        const emotes = isObject(reply.content?.emote) ? reply.content.emote : {};
+        const emotes = isObject(reply.content?.emote)
+            ? reply.content.emote
+            : isObject(reply.content?.emotes)
+                ? reply.content.emotes
+                : {};
         const tokens = message.split(/(\[[^\]]+\])/g);
         for (const token of tokens) {
             const emote = emotes[token];
@@ -1407,6 +1483,14 @@
                 member: { ...previous.member, ...candidate.member }
             });
         }
+
+        if (target === state.pageMentionCandidates) {
+            while (target.size > CONFIG.maxPageMentionCandidates) {
+                const oldestKey = target.keys().next().value;
+                if (oldestKey === undefined) break;
+                target.delete(oldestKey);
+            }
+        }
         return [...target.values()];
     }
 
@@ -1543,11 +1627,16 @@
     function updateComposerMentionMap(composer) {
         if (!composer?.mentionMap || !composer.textarea) return;
         const text = composer.textarea.value || '';
+        const mentionedNames = new Set();
+        for (const match of text.matchAll(/@([^\s@]+)/gu)) {
+            mentionedNames.add(match[1]);
+        }
+
         for (const [uname] of composer.mentionMap) {
-            if (!text.includes(`@${uname}`)) composer.mentionMap.delete(uname);
+            if (!mentionedNames.has(uname)) composer.mentionMap.delete(uname);
         }
         for (const candidate of composer.mentionCandidates?.values() || []) {
-            if (candidate.mid && text.includes(`@${candidate.uname}`)) {
+            if (candidate.mid && mentionedNames.has(candidate.uname)) {
                 composer.mentionMap.set(candidate.uname, candidate.mid);
             }
         }
@@ -2064,7 +2153,6 @@
         composer.searchLoading = false;
         if (composer.emotePanel) composer.emotePanel.hidden = true;
         if (composer.mentionPanel) composer.mentionPanel.hidden = true;
-        composer.mentionManual = false;
         composer.emojiButton?.setAttribute('aria-expanded', 'false');
         composer.mentionButton?.setAttribute('aria-expanded', 'false');
     }
@@ -2130,7 +2218,6 @@
         if (isVisible) return;
 
         if (!composerMentionQuery(composer.textarea)) insertComposerText(composer.textarea, '@');
-        composer.mentionManual = true;
         composer.mentionPanel.hidden = false;
         composer.mentionButton.setAttribute('aria-expanded', 'true');
         const mention = composerMentionQuery(composer.textarea);
@@ -2214,7 +2301,6 @@
             mentionPanel,
             mentionTitle,
             mentionList,
-            mentionManual: false,
             mentionCandidates: new Map(),
             mentionMap: new Map(),
             searchCandidates: [],
@@ -2381,6 +2467,13 @@
             panel.items.set(reply.rpid, { reply, item, like, dislike, replyButton });
         }
         body.appendChild(fragment);
+        if (replies.truncated) {
+            body.appendChild(createTextElement(
+                'div',
+                'bdv-dialog-status bdv-dialog-error',
+                '对话较长，已达到加载上限，列表可能不是完整内容'
+            ));
+        }
     }
 
     function createPanel() {
@@ -2545,7 +2638,7 @@
     }
 
     function dialogCacheKey(info, oid) {
-        return `${info.type || CONFIG.pageType}:${oid || info.oid || ''}:${info.root}:${info.dialog}`;
+        return `${safeString(info.type)}:${oid || info.oid || ''}:${info.root}:${info.dialog}`;
     }
 
     function updateReplyAfterAction(reply, kind, requestedAction) {
@@ -2574,10 +2667,11 @@
 
         try {
             const info = { ...panel.info, oid: reply.oid || panel.info.oid, type: reply.type || panel.info.type };
+            const type = requireCommentType(info);
             const oid = await resolveOid(info, controller.signal);
             await postForm(
                 kind === 'like' ? '/x/v2/reply/action' : '/x/v2/reply/hate',
-                { type: info.type || CONFIG.pageType, oid, rpid: reply.rpid, action: requestedAction },
+                { type, oid, rpid: reply.rpid, action: requestedAction },
                 controller.signal
             );
             updateReplyAfterAction(reply, kind, requestedAction);
@@ -2617,9 +2711,10 @@
 
         try {
             const info = { ...panel.info, oid: target.oid || panel.info.oid, type: target.type || panel.info.type };
+            const type = requireCommentType(info);
             const oid = await resolveOid(info, controller.signal);
             await postForm('/x/v2/reply/add', {
-                type: info.type || CONFIG.pageType,
+                type,
                 oid,
                 root: info.root || target.root,
                 parent: target.rpid,
@@ -2658,11 +2753,12 @@
     }
 
     async function fetchDialogPage(info, minFloor, signal) {
+        const type = requireCommentType(info);
         const oid = await resolveOid(info, signal);
         if (!oid) throw new Error('缺少评论区 ID');
 
         const url = new URL(`${CONFIG.apiBase}/x/v2/reply/dialog/cursor`);
-        url.searchParams.set('type', info.type || CONFIG.pageType);
+        url.searchParams.set('type', type);
         url.searchParams.set('oid', oid);
         url.searchParams.set('root', info.root);
         url.searchParams.set('dialog', info.dialog);
@@ -2709,6 +2805,7 @@
         let minFloor = 0;
         let previousMaxFloor = -1;
         let dialogMaxFloor = null;
+        let reachedDialogEnd = false;
 
         for (let page = 0; page < CONFIG.maxPages; page += 1) {
             const data = await fetchDialogPage({ ...info, oid: resolvedOid }, minFloor, signal);
@@ -2724,17 +2821,39 @@
             const cursorMax = Number(data.cursor?.max_floor);
             const currentDialogMax = Number(data.dialog?.max_floor);
             if (Number.isFinite(currentDialogMax)) dialogMaxFloor = currentDialogMax;
-            if (!Number.isFinite(cursorMax)) break;
-            if (cursorMax <= previousMaxFloor) break;
+            if (!Number.isFinite(cursorMax)) {
+                reachedDialogEnd = true;
+                break;
+            }
+            if (cursorMax <= previousMaxFloor) {
+                reachedDialogEnd = true;
+                break;
+            }
             previousMaxFloor = cursorMax;
-            if (dialogMaxFloor !== null && cursorMax >= dialogMaxFloor) break;
+            if (dialogMaxFloor !== null && cursorMax >= dialogMaxFloor) {
+                reachedDialogEnd = true;
+                break;
+            }
 
             const nextFloor = cursorMax + 1;
             if (!Number.isSafeInteger(nextFloor) || nextFloor <= minFloor) break;
             minFloor = nextFloor;
         }
 
+        if (!reachedDialogEnd) {
+            Object.defineProperty(replies, 'truncated', {
+                value: true,
+                enumerable: false,
+                configurable: true
+            });
+        }
+
         state.dialogCache.set(cacheKey, { timestamp: Date.now(), replies });
+        while (state.dialogCache.size > CONFIG.maxDialogCacheEntries) {
+            const oldestKey = state.dialogCache.keys().next().value;
+            if (oldestKey === undefined) break;
+            state.dialogCache.delete(oldestKey);
+        }
         return replies;
     }
 
@@ -2774,7 +2893,7 @@
         state.pageMentionCandidates.clear();
         state.dialogCache.clear();
         closeDialogPanel();
-        scheduleScan();
+        scheduleFullScan();
     }
 
     function init() {
@@ -2785,10 +2904,11 @@
         window.addEventListener('hashchange', handleRouteChange, true);
         state.scanInterval = window.setInterval(() => {
             handleRouteChange();
-            scheduleScan();
+            // 低频全量扫描只作为属性更新、ShadowRoot 重建等场景的兜底。
+            scheduleFullScan();
         }, CONFIG.scanIntervalMs);
         ensureGlobalStyles();
-        scheduleScan();
+        scheduleFullScan();
     }
 
     init();
