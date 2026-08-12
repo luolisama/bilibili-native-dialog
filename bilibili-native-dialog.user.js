@@ -1,11 +1,11 @@
 // ==UserScript==
 // @name         bilibili类原生查看对话
 // @namespace    https://github.com/nsdd/bilibili-native-dialog
-// @version      0.5.6
+// @version      0.5.9
 // @author       luolisama
 // @downloadURL  https://github.com/luolisama/bilibili-native-dialog/raw/refs/heads/main/bilibili-native-dialog.user.js?download=1
 // @updateURL    https://github.com/luolisama/bilibili-native-dialog/raw/refs/heads/main/bilibili-native-dialog.user.js?download=1
-// @description  在 B 站原生楼中楼操作栏中添加同风格的“查看对话”，并提供评论区式互动、表情和原生风格 @ 回复。
+// @description  在 B 站原生楼中楼操作栏中添加同风格的“查看对话”，并直接复用 B 站原生评论组件渲染对话列表。
 // @match        https://www.bilibili.com/*
 // @match        https://bilibili.com/*
 // @match        https://*.bilibili.com/*
@@ -50,6 +50,7 @@
         fullScanPending: false,
         routeKey: location.href,
         dialogCache: new Map(),
+        pageReplyHosts: new Map(),
         activePanel: null,
         activeAbortController: null,
         interactionControllers: new Set(),
@@ -300,7 +301,10 @@
             action,
             member,
             content,
-            location: firstString(control.location, raw.location)
+            location: firstString(control.location, raw.location),
+            // 保留 API 原始评论对象。对话列表直接交给 B 站自己的
+            // bili-comment-reply-renderer 渲染，不能只传裁剪后的字段。
+            raw
         };
     }
 
@@ -471,8 +475,14 @@
 
     function processReplyHost(host) {
         if (!isReplyHost(host) || !host.shadowRoot) return;
+        // 对话面板中的原生 renderer 也是 bili-comment-reply-renderer。
+        // 标记后跳过扫描，避免在弹窗自己的评论行里再次插入“查看对话”。
+        if (host.getAttribute?.('data-bdv-dialog-native') === 'true') return;
         const info = extractReplyData(host);
         if (!info) return;
+        // 记录页面原评论实例。弹窗里的原生 renderer 没有 B 站评论树上下文，
+        // 互动时需要把点击转发给这个仍挂在页面评论树中的实例。
+        if (host.isConnected) state.pageReplyHosts.set(info.rpid, host);
         rememberPageMentionData(info);
         insertDialogLink(host, info);
     }
@@ -660,69 +670,25 @@
                 text-align: center;
                 font-size: 14px;
             }
-            .bdv-dialog-item {
-                display: grid;
-                grid-template-columns: 40px minmax(0, 1fr);
-                gap: 10px;
-                padding: 14px 0;
+            /* 对话内容由 B 站自己的 Shadow DOM 评论渲染器负责。这里仅提供
+               列表分隔和当前回复高亮，不复制头像、等级、富文本或操作栏。 */
+            .bdv-dialog-native-item {
+                display: block;
+                min-width: 0;
+                padding: 0;
                 border-bottom: 1px solid #f1f2f3;
             }
-            .bdv-dialog-item:last-child { border-bottom: 0; }
-            .bdv-dialog-item[data-current="true"] {
+            .bdv-dialog-native-item:last-child { border-bottom: 0; }
+            .bdv-dialog-native-item[data-current="true"] {
                 margin: 0 -10px;
-                padding-left: 10px;
-                padding-right: 10px;
+                padding: 0 10px;
                 border-radius: 7px;
                 background: rgba(0, 174, 236, .07);
             }
-            .bdv-dialog-avatar-link {
+            .bdv-dialog-native-item > bili-comment-reply-renderer {
                 display: block;
-                width: 40px;
-                height: 40px;
-                border-radius: 50%;
-                outline: none;
-            }
-            .bdv-dialog-avatar-link:focus-visible {
-                box-shadow: 0 0 0 2px #00aeec;
-            }
-            .bdv-dialog-avatar {
-                display: block;
-                width: 40px;
-                height: 40px;
-                border-radius: 50%;
-                object-fit: cover;
-                background: #f1f2f3;
-                transition: box-shadow .15s ease;
-            }
-            .bdv-dialog-avatar-link:hover .bdv-dialog-avatar {
-                box-shadow: 0 0 0 2px rgba(0, 174, 236, .35);
-            }
-            .bdv-dialog-main { min-width: 0; }
-            .bdv-dialog-user {
-                display: flex;
-                flex-wrap: wrap;
-                align-items: center;
-                gap: 6px;
-                font-size: 13px;
-                line-height: 20px;
-            }
-            .bdv-dialog-username-link,
-            .bdv-dialog-username-text {
-                max-width: min(260px, 100%);
-                overflow: hidden;
-                color: #61666d;
-                font-weight: 500;
-                text-overflow: ellipsis;
-                white-space: nowrap;
-            }
-            .bdv-dialog-username-link {
-                text-decoration: none;
-                transition: color .15s ease;
-            }
-            .bdv-dialog-username-link:hover,
-            .bdv-dialog-username-link:focus-visible {
-                color: #00aeec;
-                outline: none;
+                min-width: 0;
+                width: 100%;
             }
             .bdv-dialog-level {
                 display: inline-flex;
@@ -750,72 +716,12 @@
                 font-size: 11px;
                 font-weight: 600;
             }
-            .bdv-dialog-message {
-                margin-top: 2px;
-                color: #18191c;
-                font-size: 14px;
-                line-height: 1.65;
-                white-space: pre-wrap;
-                word-break: break-word;
-            }
             .bdv-dialog-emote {
                 width: 22px;
                 height: 22px;
                 margin: 0 2px;
                 vertical-align: -6px;
                 object-fit: contain;
-            }
-            .bdv-dialog-meta {
-                display: flex;
-                flex-wrap: wrap;
-                align-items: center;
-                gap: 14px;
-                margin-top: 6px;
-                color: #9499a0;
-                font-size: 12px;
-                line-height: 18px;
-            }
-            .bdv-dialog-action {
-                display: inline-flex;
-                align-items: center;
-                gap: 4px;
-                min-height: 22px;
-                margin: 0;
-                padding: 0;
-                border: 0;
-                background: transparent;
-                color: #9499a0;
-                font: inherit;
-                cursor: pointer;
-                transition: color .15s ease, opacity .15s ease;
-            }
-            .bdv-dialog-action[data-action="dislike"] {
-                gap: 0;
-            }
-            .bdv-dialog-action:hover,
-            .bdv-dialog-action:focus-visible {
-                color: #00aeec;
-                outline: none;
-            }
-            .bdv-dialog-action[data-active="true"] {
-                color: #00aeec;
-            }
-            .bdv-dialog-action[data-action="dislike"][data-active="true"] {
-                color: #61666d;
-            }
-            .bdv-dialog-action[aria-busy="true"] {
-                opacity: .55;
-                cursor: wait;
-            }
-            .bdv-dialog-action-icon {
-                display: inline-flex;
-                width: 15px;
-                height: 15px;
-                flex: 0 0 15px;
-            }
-            .bdv-dialog-action-icon svg {
-                width: 100%;
-                height: 100%;
             }
             .bdv-dialog-composer {
                 position: relative;
@@ -1151,16 +1057,13 @@
                 border-color: rgba(255, 255, 255, .08);
             }
             :is(html.dark, body.dark, html[data-theme="dark"]) .bdv-dialog-header,
-            :is(html.dark, body.dark, html[data-theme="dark"]) .bdv-dialog-item {
+            :is(html.dark, body.dark, html[data-theme="dark"]) .bdv-dialog-native-item {
                 border-color: #303236;
             }
             :is(html.dark, body.dark, html[data-theme="dark"]) .bdv-dialog-close:hover,
             :is(html.dark, body.dark, html[data-theme="dark"]) .bdv-dialog-close:focus-visible {
                 color: #e5e7eb;
                 background: #303236;
-            }
-            :is(html.dark, body.dark, html[data-theme="dark"]) .bdv-dialog-message {
-                color: #e5e7eb;
             }
             :is(html.dark, body.dark, html[data-theme="dark"]) .bdv-dialog-composer {
                 border-color: #303236;
@@ -1231,31 +1134,6 @@
         return /^https?:\/\//i.test(url) ? url : '';
     }
 
-    function formatTime(timestamp) {
-        const seconds = Number(timestamp);
-        if (!Number.isFinite(seconds) || seconds <= 0) return '未知时间';
-
-        const diff = Math.max(0, Date.now() - seconds * 1000);
-        const minute = 60 * 1000;
-        const hour = 60 * minute;
-        const day = 24 * hour;
-        if (diff < minute) return '刚刚';
-        if (diff < hour) return `${Math.floor(diff / minute)}分钟前`;
-        if (diff < day) return `${Math.floor(diff / hour)}小时前`;
-        if (diff < 30 * day) return `${Math.floor(diff / day)}天前`;
-
-        const date = new Date(seconds * 1000);
-        const year = date.getFullYear();
-        const month = String(date.getMonth() + 1).padStart(2, '0');
-        const dayValue = String(date.getDate()).padStart(2, '0');
-        return `${year}-${month}-${dayValue}`;
-    }
-
-    function validColor(value) {
-        const color = safeString(value);
-        return /^#[0-9a-f]{3,8}$/i.test(color) ? color : '';
-    }
-
     function createTextElement(tagName, className, text) {
         const element = document.createElement(tagName);
         element.className = className;
@@ -1272,37 +1150,6 @@
         return String(count);
     }
 
-    function profileHref(mid) {
-        const userId = safeString(mid);
-        return /^\d+$/.test(userId) ? `https://space.bilibili.com/${userId}` : '';
-    }
-
-    function createSvgIcon(kind) {
-        const svgNamespace = 'http://www.w3.org/2000/svg';
-        const wrapper = document.createElement('span');
-        wrapper.className = 'bdv-dialog-action-icon';
-        wrapper.setAttribute('aria-hidden', 'true');
-
-        const svg = document.createElementNS(svgNamespace, 'svg');
-        svg.setAttribute('viewBox', '0 0 24 24');
-        svg.setAttribute('fill', 'none');
-        svg.setAttribute('stroke', 'currentColor');
-        svg.setAttribute('stroke-width', '1.8');
-        svg.setAttribute('stroke-linecap', 'round');
-        svg.setAttribute('stroke-linejoin', 'round');
-
-        const path = document.createElementNS(svgNamespace, 'path');
-        if (kind === 'reply') {
-            path.setAttribute('d', 'M4 5h16a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H9l-5 3v-3H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Z');
-        } else {
-            path.setAttribute('d', 'M7 10v11H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3m0 11h9.3a2 2 0 0 0 1.96-1.6l1.55-7A2 2 0 0 0 17.85 9H14l.5-3.1A3.35 3.35 0 0 0 11.2 2.1L7 10');
-            if (kind === 'dislike') path.setAttribute('transform', 'rotate(180 12 12)');
-        }
-        svg.appendChild(path);
-        wrapper.appendChild(svg);
-        return wrapper;
-    }
-
     function createLevelBadge(reply) {
         const rawLevel = Number(reply.member?.level_info?.current_level);
         if (!Number.isFinite(rawLevel) || rawLevel < 0) return null;
@@ -1311,72 +1158,6 @@
         const badge = createTextElement('span', `bdv-dialog-level bdv-dialog-level--${level}`, `LV${level}`);
         badge.title = `用户等级 LV${level}`;
         return badge;
-    }
-
-    function renderMessageContent(container, reply) {
-        const message = safeString(reply.content?.message);
-        if (!message) {
-            container.textContent = '[该评论没有文字内容]';
-            return;
-        }
-
-        const emotes = isObject(reply.content?.emote)
-            ? reply.content.emote
-            : isObject(reply.content?.emotes)
-                ? reply.content.emotes
-                : {};
-        const tokens = message.split(/(\[[^\]]+\])/g);
-        for (const token of tokens) {
-            const emote = emotes[token];
-            const emoteUrl = isObject(emote) ? toSafeUrl(emote.url) : '';
-            if (!emoteUrl) {
-                container.appendChild(document.createTextNode(token));
-                continue;
-            }
-            const image = document.createElement('img');
-            image.className = 'bdv-dialog-emote';
-            image.src = emoteUrl;
-            image.alt = token;
-            image.title = token;
-            image.loading = 'lazy';
-            container.appendChild(image);
-        }
-    }
-
-    function createActionButton(kind, panel, reply) {
-        const button = document.createElement('button');
-        button.type = 'button';
-        button.className = 'bdv-dialog-action';
-        button.dataset.action = kind;
-        button.setAttribute('aria-busy', 'false');
-
-        const label = kind === 'like' ? '点赞' : kind === 'dislike' ? '点踩' : '回复';
-        button.title = label;
-        button.setAttribute('aria-label', label);
-        button.appendChild(createSvgIcon(kind));
-
-        const value = kind === 'dislike'
-            ? null
-            : createTextElement('span', 'bdv-dialog-action-value', kind === 'like' ? formatCount(reply.like) : label);
-        if (value) button.appendChild(value);
-
-        const control = { kind, button, value };
-        if (kind === 'like' || kind === 'dislike') {
-            button.addEventListener('click', () => toggleReplyAction(panel, reply, kind, control));
-        } else {
-            button.addEventListener('click', () => showReplyComposer(panel, reply));
-        }
-        updateActionControl(control, reply);
-        return control;
-    }
-
-    function updateActionControl(control, reply) {
-        if (!control || !reply) return;
-        const active = control.kind === 'like'
-            ? reply.action === 1
-            : control.kind === 'dislike' && reply.action === 2;
-        control.button.dataset.active = String(Boolean(active));
-        if (control.kind === 'like') control.value.textContent = formatCount(reply.like);
     }
 
     function updateComposerCount(composer) {
@@ -2380,6 +2161,251 @@
         window.setTimeout(() => notice.isConnected && notice.remove(), 4500);
     }
 
+    function getNativeReplyData(reply) {
+        const raw = isObject(reply?.raw) ? reply.raw : { ...reply };
+        // raw 是接口返回的完整对象；仅在裁剪对象的情况下补齐必要字段。
+        if (!isObject(raw.member)) raw.member = reply.member || {};
+        if (!isObject(raw.content)) raw.content = reply.content || {};
+        if (!isObject(raw.reply_control)) {
+            raw.reply_control = {};
+            if (reply.location) raw.reply_control.location = reply.location;
+        }
+        for (const key of ['rpid', 'root', 'parent', 'dialog', 'oid', 'type', 'mid', 'ctime', 'like', 'action']) {
+            if (raw[key] === undefined && reply[key] !== undefined) raw[key] = reply[key];
+        }
+        return raw;
+    }
+
+    function assignNativeReplyData(renderer, reply) {
+        if (!renderer || !reply) return;
+        const raw = getNativeReplyData(reply);
+        // 不同版本的 B 站组件曾使用过 __data、data 和 reply 三种入口。
+        // 同时赋值只针对原生组件实例，不生成任何仿制评论节点。
+        for (const property of ['__data', '__data__', 'data', 'reply', 'replyData', 'comment']) {
+            try {
+                renderer[property] = raw;
+            } catch (_) {
+                // 某些版本的属性是只读 getter，继续尝试其它版本入口。
+            }
+        }
+
+        const attributes = {
+            'data-rpid': reply.rpid,
+            'data-root': reply.root,
+            'data-parent': reply.parent,
+            'data-dialog': reply.dialog,
+            'data-oid': reply.oid,
+            'data-type': reply.type
+        };
+        for (const [name, value] of Object.entries(attributes)) {
+            if (value !== undefined && value !== null && value !== '') {
+                try {
+                    renderer.setAttribute(name, String(value));
+                } catch (_) {
+                    // 自定义元素属性失败不应阻止其它评论继续渲染。
+                }
+            }
+        }
+        try {
+            renderer.requestUpdate?.();
+        } catch (_) {
+            // Lit 版本没有暴露 requestUpdate 时由属性 setter 自己触发更新。
+        }
+    }
+
+    function nativeReplyRendererAvailable() {
+        return Boolean(window.customElements?.get?.('bili-comment-reply-renderer'));
+    }
+
+    function nativeReplyActionLabel(element) {
+        if (!element || element.nodeType !== Node.ELEMENT_NODE) return '';
+        return firstString(
+            element.getAttribute?.('aria-label'),
+            element.getAttribute?.('title'),
+            element.getAttribute?.('data-action'),
+            element.getAttribute?.('data-type')
+        ).toLocaleLowerCase();
+    }
+
+    function nativeActionKind(element) {
+        if (!element || element.nodeType !== Node.ELEMENT_NODE) return false;
+        const id = safeString(element.id).toLowerCase();
+        if (id === 'like' || id === 'dislike' || id === 'reply') return id;
+
+        const label = nativeReplyActionLabel(element);
+        const tagName = safeString(element.localName).toLowerCase();
+        const role = safeString(element.getAttribute?.('role')).toLowerCase();
+        const className = safeString(element.getAttribute?.('class')).toLowerCase();
+        if ((label.includes('回复') || label.includes('reply'))
+            && (tagName === 'button' || tagName === 'a' || role === 'button' || /action|reply|opera/.test(className))) {
+            return 'reply';
+        }
+        if (isReplyActionElement(element)) return 'reply';
+        return '';
+    }
+
+    function findNativeActionButton(root, kind) {
+        if (!root?.querySelectorAll || !kind) return null;
+        for (const element of root.querySelectorAll('*')) {
+            const id = safeString(element.id).toLowerCase();
+            if (id === kind) {
+                const button = element.localName === 'button'
+                    ? element
+                    : element.shadowRoot?.querySelector('button') || element.querySelector?.('button');
+                if (button) return button;
+            }
+            if (element.shadowRoot) {
+                const nested = findNativeActionButton(element.shadowRoot, kind);
+                if (nested) return nested;
+            }
+        }
+        return null;
+    }
+
+    function getPageReplyHost(reply) {
+        const rpid = safeString(reply?.rpid);
+        if (!rpid) return null;
+        const host = state.pageReplyHosts.get(rpid);
+        if (host?.isConnected && host.shadowRoot
+            && host.getAttribute?.('data-bdv-dialog-native') !== 'true') {
+            return host;
+        }
+        state.pageReplyHosts.delete(rpid);
+        return null;
+    }
+
+    function getPageNativeActionButton(reply, kind) {
+        const host = getPageReplyHost(reply);
+        return host ? findNativeActionButton(host.shadowRoot, kind) : null;
+    }
+
+    function updateReplyActionState(reply, kind, requestedAction) {
+        const previousAction = Number(reply.action) || 0;
+        const previousLike = Math.max(0, Number(reply.like) || 0);
+        if (kind === 'like') {
+            if (requestedAction === 1 && previousAction !== 1) reply.like = previousLike + 1;
+            if (requestedAction === 0 && previousAction === 1) reply.like = Math.max(0, previousLike - 1);
+            reply.action = requestedAction === 1 ? 1 : 0;
+        } else if (kind === 'dislike') {
+            if (requestedAction === 1 && previousAction === 1) reply.like = Math.max(0, previousLike - 1);
+            reply.action = requestedAction === 1 ? 2 : 0;
+        }
+        if (isObject(reply.raw)) {
+            try {
+                reply.raw.like = reply.like;
+                reply.raw.action = reply.action;
+            } catch (_) {
+                // 只读数据对象不影响接口操作结果。
+            }
+        }
+    }
+
+    function updateDialogNativeReply(panel, reply) {
+        const entry = panel?.items?.get(reply?.rpid);
+        if (entry?.renderer) assignNativeReplyData(entry.renderer, reply);
+    }
+
+    function scheduleDialogRefresh(panel, delay = 650) {
+        if (!panel || state.activePanel !== panel) return;
+        if (panel.refreshTimer) window.clearTimeout(panel.refreshTimer);
+        panel.refreshTimer = window.setTimeout(async () => {
+            panel.refreshTimer = null;
+            if (state.activePanel !== panel || !panel.info) return;
+            const controller = new AbortController();
+            state.interactionControllers.add(controller);
+            try {
+                state.dialogCache.delete(dialogCacheKey(panel.info, panel.info.oid));
+                const replies = await fetchAllDialog(panel.info, controller.signal);
+                if (state.activePanel === panel && !controller.signal.aborted) {
+                    renderDialogItems(panel, replies, panel.info);
+                }
+            } catch (_) {
+                // 原生按钮已经完成了页面侧操作；刷新失败时保留当前列表。
+            } finally {
+                state.interactionControllers.delete(controller);
+            }
+        }, delay);
+    }
+
+    async function fallbackDialogAction(panel, reply, kind) {
+        if (!panel?.info || !reply || (kind !== 'like' && kind !== 'dislike')) return;
+        const currentAction = kind === 'like' ? Number(reply.action) === 1 : Number(reply.action) === 2;
+        const requestedAction = currentAction ? 0 : 1;
+        const controller = new AbortController();
+        state.interactionControllers.add(controller);
+        try {
+            const info = { ...panel.info, oid: reply.oid || panel.info.oid, type: reply.type || panel.info.type };
+            const type = requireCommentType(info);
+            const oid = await resolveOid(info, controller.signal);
+            await postForm(
+                kind === 'like' ? '/x/v2/reply/action' : '/x/v2/reply/hate',
+                { type, oid, rpid: reply.rpid, action: requestedAction },
+                controller.signal
+            );
+            updateReplyActionState(reply, kind, requestedAction);
+            updateDialogNativeReply(panel, reply);
+            showPanelNotice(panel, kind === 'like' ? '点赞状态已更新' : '点踩状态已更新');
+        } catch (error) {
+            if (!controller.signal.aborted && state.activePanel === panel) {
+                showPanelNotice(panel, error?.message || '评论操作失败');
+            }
+        } finally {
+            state.interactionControllers.delete(controller);
+        }
+    }
+
+    function bindNativeReplyAction(panel, reply, renderer) {
+        if (!renderer || renderer.dataset.bdvReplyBridge === 'true') return;
+        renderer.dataset.bdvReplyBridge = 'true';
+        renderer.addEventListener('click', (event) => {
+            const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+            const kind = path.map(nativeActionKind).find(Boolean);
+            if (!kind) return;
+
+            // 独立创建的 renderer 没有 B 站评论树的登录/上下文 provider。
+            // 所有互动先阻止它自己的 handler，再转发给页面原评论实例。
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation?.();
+            if (kind === 'reply') {
+                showReplyComposer(panel, reply);
+                return;
+            }
+
+            const pageButton = getPageNativeActionButton(reply, kind);
+            if (pageButton) {
+                pageButton.click();
+                scheduleDialogRefresh(panel);
+                return;
+            }
+            fallbackDialogAction(panel, reply, kind);
+        }, true);
+    }
+
+    function createNativeReplyRenderer(panel, reply) {
+        if (!nativeReplyRendererAvailable()) return null;
+        let renderer;
+        try {
+            renderer = document.createElement('bili-comment-reply-renderer');
+        } catch (_) {
+            return null;
+        }
+        renderer.className = 'bdv-dialog-native-reply';
+        renderer.setAttribute('data-bdv-dialog-native', 'true');
+        assignNativeReplyData(renderer, reply);
+        bindNativeReplyAction(panel, reply, renderer);
+
+        // 组件升级/首次 Lit 更新的时序在不同页面不完全一致，升级后再写一次
+        // 数据可以覆盖“先创建、后注册”的版本，同时仍然只使用原生渲染。
+        const refresh = () => {
+            if (renderer.isConnected) assignNativeReplyData(renderer, reply);
+        };
+        queueMicrotask(refresh);
+        window.setTimeout(refresh, 0);
+        window.setTimeout(refresh, 80);
+        return renderer;
+    }
+
     function renderDialogItems(panel, replies, info) {
         const body = panel.body;
         const currentRpid = info.rpid;
@@ -2394,77 +2420,26 @@
             return;
         }
 
+        if (!nativeReplyRendererAvailable()) {
+            body.appendChild(createTextElement(
+                'div',
+                'bdv-dialog-status bdv-dialog-error',
+                '当前页面尚未加载 B 站原生评论组件，无法显示对话'
+            ));
+            return;
+        }
+
         const fragment = document.createDocumentFragment();
         for (const reply of replies) {
             const item = document.createElement('article');
-            item.className = 'bdv-dialog-item';
+            item.className = 'bdv-dialog-native-item';
             item.dataset.current = reply.rpid === currentRpid ? 'true' : 'false';
             item.dataset.rpid = reply.rpid;
-
-            const avatar = document.createElement('img');
-            avatar.className = 'bdv-dialog-avatar';
-            avatar.alt = safeString(reply.member?.uname) || '用户头像';
-            avatar.loading = 'lazy';
-            const avatarUrl = toSafeUrl(reply.member?.avatar || reply.member?.face);
-            if (avatarUrl) avatar.src = avatarUrl;
-
-            const avatarHref = profileHref(reply.mid || reply.member?.mid);
-            const avatarHolder = document.createElement(avatarHref ? 'a' : 'div');
-            avatarHolder.className = 'bdv-dialog-avatar-link';
-            if (avatarHref) {
-                avatarHolder.href = avatarHref;
-                avatarHolder.target = '_blank';
-                avatarHolder.rel = 'noopener noreferrer';
-                avatarHolder.title = `打开 ${safeString(reply.member?.uname) || '用户'} 的个人空间`;
-            }
-            avatarHolder.appendChild(avatar);
-
-            const main = document.createElement('div');
-            main.className = 'bdv-dialog-main';
-            const user = document.createElement('div');
-            user.className = 'bdv-dialog-user';
-
-            const username = document.createElement(avatarHref ? 'a' : 'span');
-            username.className = avatarHref ? 'bdv-dialog-username-link' : 'bdv-dialog-username-text';
-            username.textContent = safeString(reply.member?.uname) || '匿名用户';
-            if (avatarHref) {
-                username.href = avatarHref;
-                username.target = '_blank';
-                username.rel = 'noopener noreferrer';
-            }
-            const nicknameColor = validColor(reply.member?.vip?.nickname_color);
-            if (nicknameColor) username.style.color = nicknameColor;
-            user.appendChild(username);
-
-            const level = createLevelBadge(reply);
-            if (level) user.appendChild(level);
-
-            if (item.dataset.current === 'true') {
-                user.appendChild(createTextElement('span', 'bdv-dialog-current', '当前回复'));
-            }
-
-            const message = createTextElement('div', 'bdv-dialog-message', '');
-            renderMessageContent(message, reply);
-
-            const meta = document.createElement('div');
-            meta.className = 'bdv-dialog-meta';
-            meta.appendChild(createTextElement('span', '', formatTime(reply.ctime)));
-            if (reply.location) {
-                const location = reply.location.startsWith('IP属地') ? reply.location : `IP属地：${reply.location}`;
-                meta.appendChild(createTextElement('span', '', location));
-            }
-            const like = createActionButton('like', panel, reply);
-            const dislike = createActionButton('dislike', panel, reply);
-            const replyButton = createActionButton('reply', panel, reply);
-            meta.append(like.button, dislike.button, replyButton.button);
-
-            main.appendChild(user);
-            main.appendChild(message);
-            main.appendChild(meta);
-            item.appendChild(avatarHolder);
-            item.appendChild(main);
+            const renderer = createNativeReplyRenderer(panel, reply);
+            if (!renderer) continue;
+            item.appendChild(renderer);
             fragment.appendChild(item);
-            panel.items.set(reply.rpid, { reply, item, like, dislike, replyButton });
+            panel.items.set(reply.rpid, { reply, item, renderer });
         }
         body.appendChild(fragment);
         if (replies.truncated) {
@@ -2516,7 +2491,8 @@
             info: null,
             replies: [],
             items: new Map(),
-            composer: null
+            composer: null,
+            refreshTimer: null
         };
         panelState.composer = createReplyComposer(panelState);
         panel.appendChild(panelState.composer.container);
@@ -2533,6 +2509,10 @@
     }
 
     function closeDialogPanel() {
+        if (state.activePanel?.refreshTimer) {
+            window.clearTimeout(state.activePanel.refreshTimer);
+            state.activePanel.refreshTimer = null;
+        }
         if (state.activeAbortController) {
             state.activeAbortController.abort();
             state.activeAbortController = null;
@@ -2639,53 +2619,6 @@
 
     function dialogCacheKey(info, oid) {
         return `${safeString(info.type)}:${oid || info.oid || ''}:${info.root}:${info.dialog}`;
-    }
-
-    function updateReplyAfterAction(reply, kind, requestedAction) {
-        const previousAction = reply.action;
-        if (kind === 'like') {
-            if (requestedAction === 1 && previousAction !== 1) reply.like += 1;
-            if (requestedAction === 0 && previousAction === 1) reply.like = Math.max(0, reply.like - 1);
-            reply.action = requestedAction === 1 ? 1 : 0;
-            return;
-        }
-
-        if (requestedAction === 1 && previousAction === 1) {
-            reply.like = Math.max(0, reply.like - 1);
-        }
-        reply.action = requestedAction === 1 ? 2 : 0;
-    }
-
-    async function toggleReplyAction(panel, reply, kind, control) {
-        if (!panel?.info || !control || control.button.getAttribute('aria-busy') === 'true') return;
-
-        const currentAction = kind === 'like' ? reply.action === 1 : reply.action === 2;
-        const requestedAction = currentAction ? 0 : 1;
-        const controller = new AbortController();
-        state.interactionControllers.add(controller);
-        control.button.setAttribute('aria-busy', 'true');
-
-        try {
-            const info = { ...panel.info, oid: reply.oid || panel.info.oid, type: reply.type || panel.info.type };
-            const type = requireCommentType(info);
-            const oid = await resolveOid(info, controller.signal);
-            await postForm(
-                kind === 'like' ? '/x/v2/reply/action' : '/x/v2/reply/hate',
-                { type, oid, rpid: reply.rpid, action: requestedAction },
-                controller.signal
-            );
-            updateReplyAfterAction(reply, kind, requestedAction);
-            const entry = panel.items.get(reply.rpid);
-            updateActionControl(entry?.like, reply);
-            updateActionControl(entry?.dislike, reply);
-        } catch (error) {
-            if (!controller.signal.aborted && state.activePanel === panel) {
-                showPanelNotice(panel, error?.message || '评论操作失败');
-            }
-        } finally {
-            state.interactionControllers.delete(controller);
-            if (control.button.isConnected) control.button.setAttribute('aria-busy', 'false');
-        }
     }
 
     async function submitReply(panel, message) {
@@ -2891,6 +2824,7 @@
         state.emotePromise = null;
         state.followingPromise = null;
         state.pageMentionCandidates.clear();
+        state.pageReplyHosts.clear();
         state.dialogCache.clear();
         closeDialogPanel();
         scheduleFullScan();
