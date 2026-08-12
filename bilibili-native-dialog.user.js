@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         bilibili类原生查看对话
 // @namespace    https://github.com/nsdd/bilibili-native-dialog
-// @version      0.5.10
+// @version      0.5.11
 // @author       luolisama
 // @downloadURL  https://github.com/luolisama/bilibili-native-dialog/raw/refs/heads/main/bilibili-native-dialog.user.js?download=1
 // @updateURL    https://github.com/luolisama/bilibili-native-dialog/raw/refs/heads/main/bilibili-native-dialog.user.js?download=1
@@ -27,7 +27,12 @@
         requestTimeoutMs: 15000,
         apiBase: 'https://api.bilibili.com',
         maxDialogCacheEntries: 24,
-        maxPageMentionCandidates: 300
+        maxPageMentionCandidates: 300,
+        // 原生评论组件和 dialog 接口可能有不同的更新延迟；逐步退避，
+        // 避免在接口稍慢时过早回滚弹窗里的乐观状态。
+        interactionSyncDelaysMs: Object.freeze([900, 1400, 2200, 3200, 4200]),
+        interactionSyncRetries: 5,
+        interactionDeferredRefreshMs: 6000
     });
 
     const COMMENT_TYPES = new Set(['1', '11', '12', '17']);
@@ -51,6 +56,7 @@
         routeKey: location.href,
         dialogCache: new Map(),
         pageReplyHosts: new Map(),
+        pageActionRoots: new WeakSet(),
         activePanel: null,
         activeAbortController: null,
         interactionControllers: new Set(),
@@ -482,9 +488,46 @@
         if (!info) return;
         // 记录页面原评论实例。弹窗里的原生 renderer 没有 B 站评论树上下文，
         // 互动时需要把点击转发给这个仍挂在页面评论树中的实例。
-        if (host.isConnected) state.pageReplyHosts.set(info.rpid, host);
+        if (host.isConnected) {
+            state.pageReplyHosts.set(info.rpid, host);
+            bindPageReplyActionBridge(host, info);
+        }
         rememberPageMentionData(info);
         insertDialogLink(host, info);
+    }
+
+    function bindPageReplyActionBridge(host, info) {
+        const root = host?.shadowRoot;
+        if (!root || state.pageActionRoots.has(root)) return;
+        state.pageActionRoots.add(root);
+
+        // 页面评论树仍由 B 站自己的 provider 和事件处理器负责互动。
+        // 这里只监听原生按钮点击，在组件完成真实操作后把最新状态同步到
+        // 已打开的对话列表，不拦截、不替换页面原生事件。
+        root.addEventListener('click', (event) => {
+            const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+            const kind = path.map(nativeActionKind).find(Boolean);
+            if (kind !== 'like' && kind !== 'dislike') return;
+
+            const currentInfo = extractReplyData(host) || info;
+            const rpid = safeString(currentInfo?.rpid);
+            if (!rpid) return;
+
+            const panel = state.activePanel;
+            if (!panel?.items?.has(rpid)) return;
+
+            // B 站原生处理器通常在当前事件之后才更新组件数据，
+            // 所以交给统一刷新链路延迟读取服务器/页面最终状态。
+            window.setTimeout(() => {
+                if (state.activePanel !== panel || !panel.info) return;
+                const pending = panel.pendingInteractions?.get(rpid) || null;
+                if (pending) {
+                    scheduleDialogRefresh(panel, undefined, pending);
+                } else {
+                    scheduleDialogRefresh(panel, CONFIG.interactionSyncDelaysMs[0], null, rpid);
+                }
+            }, 0);
+        }, true);
     }
 
     function isScanNode(node) {
@@ -1566,23 +1609,48 @@
         return filename.replace(/\.[^.]+$/, '');
     }
 
+    async function withRequestTimeout(signal, task, timeoutMessage) {
+        const timeoutController = new AbortController();
+        const timeoutId = window.setTimeout(
+            () => timeoutController.abort(),
+            CONFIG.requestTimeoutMs
+        );
+        const abortForwarder = () => timeoutController.abort();
+        if (signal?.aborted) timeoutController.abort();
+        signal?.addEventListener('abort', abortForwarder, { once: true });
+
+        try {
+            return await task(timeoutController.signal);
+        } catch (error) {
+            if (error?.name === 'AbortError' && !signal?.aborted) {
+                throw new Error(timeoutMessage);
+            }
+            throw error;
+        } finally {
+            window.clearTimeout(timeoutId);
+            signal?.removeEventListener('abort', abortForwarder);
+        }
+    }
+
     async function fetchWbiKeys(signal) {
         const url = new URL(`${CONFIG.apiBase}/x/web-interface/nav`);
-        const response = await fetch(url, {
-            credentials: 'include',
-            signal,
-            headers: { Accept: 'application/json' }
-        });
-        if (!response.ok) throw new Error(`WBI 密钥请求失败（HTTP ${response.status}）`);
-        const json = await response.json();
-        if (Number(json?.code) !== 0) {
-            throw new Error(json?.message || `WBI 密钥请求失败（${json?.code ?? '未知'}）`);
-        }
+        return withRequestTimeout(signal, async (requestSignal) => {
+            const response = await fetch(url, {
+                credentials: 'include',
+                signal: requestSignal,
+                headers: { Accept: 'application/json' }
+            });
+            if (!response.ok) throw new Error(`WBI 密钥请求失败（HTTP ${response.status}）`);
+            const json = await response.json();
+            if (Number(json?.code) !== 0) {
+                throw new Error(json?.message || `WBI 密钥请求失败（${json?.code ?? '未知'}）`);
+            }
 
-        const imgKey = extractWbiKey(json?.data?.wbi_img?.img_url);
-        const subKey = extractWbiKey(json?.data?.wbi_img?.sub_url);
-        if (!imgKey || !subKey) throw new Error('当前页面没有可用的 WBI 密钥');
-        return { imgKey, subKey };
+            const imgKey = extractWbiKey(json?.data?.wbi_img?.img_url);
+            const subKey = extractWbiKey(json?.data?.wbi_img?.sub_url);
+            if (!imgKey || !subKey) throw new Error('当前页面没有可用的 WBI 密钥');
+            return { imgKey, subKey };
+        }, 'WBI 密钥请求超时，请稍后重试');
     }
 
     function loadWbiKeys(signal) {
@@ -1686,22 +1754,24 @@
         const url = new URL(`${CONFIG.apiBase}/x/emote/user/panel/web`);
         url.searchParams.set('business', 'reply');
         url.searchParams.set('web_location', '333.788');
-        const response = await fetch(url, {
-            credentials: 'include',
-            signal,
-            headers: { Accept: 'application/json' }
-        });
-        if (!response.ok) throw new Error(`表情列表请求失败（HTTP ${response.status}）`);
-        const json = await response.json();
-        if (Number(json?.code) !== 0) {
-            throw new Error(json?.message || `表情列表请求失败（${json?.code ?? '未知'}）`);
-        }
+        return withRequestTimeout(signal, async (requestSignal) => {
+            const response = await fetch(url, {
+                credentials: 'include',
+                signal: requestSignal,
+                headers: { Accept: 'application/json' }
+            });
+            if (!response.ok) throw new Error(`表情列表请求失败（HTTP ${response.status}）`);
+            const json = await response.json();
+            if (Number(json?.code) !== 0) {
+                throw new Error(json?.message || `表情列表请求失败（${json?.code ?? '未知'}）`);
+            }
 
-        const packages = Array.isArray(json?.data?.packages) ? json.data.packages : [];
-        return packages.map((packageData) => {
-            const emote = getPackageEmotes(packageData);
-            return { ...packageData, emote };
-        }).filter((packageData) => packageData.emote.length);
+            const packages = Array.isArray(json?.data?.packages) ? json.data.packages : [];
+            return packages.map((packageData) => {
+                const emote = getPackageEmotes(packageData);
+                return { ...packageData, emote };
+            }).filter((packageData) => packageData.emote.length);
+        }, '表情列表请求超时，请稍后重试');
     }
 
     function loadEmotePackages(signal) {
@@ -1752,23 +1822,29 @@
             web_location: '333.788'
         };
 
-        let response;
         let json;
         let wbiError = null;
         try {
             const signedQuery = await signWbiParams(params, signal);
             const wbiUrl = new URL(`${CONFIG.apiBase}/x/web-interface/wbi/search/type`);
             wbiUrl.search = `?${signedQuery}`;
-            response = await fetch(wbiUrl, {
-                credentials: 'include',
+            json = await withRequestTimeout(
                 signal,
-                headers: { Accept: 'application/json' }
-            });
-            if (!response.ok) throw new Error(`用户搜索失败（HTTP ${response.status}）`);
-            json = await response.json();
-            if (Number(json?.code) !== 0) {
-                throw new Error(json?.message || `用户搜索失败（${json?.code ?? '未知'}）`);
-            }
+                async (requestSignal) => {
+                    const response = await fetch(wbiUrl, {
+                        credentials: 'include',
+                        signal: requestSignal,
+                        headers: { Accept: 'application/json' }
+                    });
+                    if (!response.ok) throw new Error(`用户搜索失败（HTTP ${response.status}）`);
+                    const value = await response.json();
+                    if (Number(value?.code) !== 0) {
+                        throw new Error(value?.message || `用户搜索失败（${value?.code ?? '未知'}）`);
+                    }
+                    return value;
+                },
+                '用户搜索请求超时，请稍后重试'
+            );
         } catch (error) {
             if (signal?.aborted || error?.name === 'AbortError') throw error;
             wbiError = error;
@@ -1777,16 +1853,23 @@
             // 结果，但不再作为首选，避免新网页直接被 -403 卡死。
             const legacyUrl = new URL(`${CONFIG.apiBase}/x/web-interface/search/type`);
             Object.entries(params).forEach(([key, value]) => legacyUrl.searchParams.set(key, String(value)));
-            response = await fetch(legacyUrl, {
-                credentials: 'include',
+            json = await withRequestTimeout(
                 signal,
-                headers: { Accept: 'application/json' }
-            });
-            if (!response.ok) throw wbiError || new Error(`用户搜索失败（HTTP ${response.status}）`);
-            json = await response.json();
-            if (Number(json?.code) !== 0) {
-                throw new Error(json?.message || wbiError?.message || `用户搜索失败（${json?.code ?? '未知'}）`);
-            }
+                async (requestSignal) => {
+                    const response = await fetch(legacyUrl, {
+                        credentials: 'include',
+                        signal: requestSignal,
+                        headers: { Accept: 'application/json' }
+                    });
+                    if (!response.ok) throw wbiError || new Error(`用户搜索失败（HTTP ${response.status}）`);
+                    const value = await response.json();
+                    if (Number(value?.code) !== 0) {
+                        throw new Error(value?.message || wbiError?.message || `用户搜索失败（${value?.code ?? '未知'}）`);
+                    }
+                    return value;
+                },
+                '用户搜索请求超时，请稍后重试'
+            );
         }
 
         const result = flattenMentionSearchResults(json?.data?.result ?? json?.data);
@@ -1798,13 +1881,19 @@
 
     async function fetchFollowingCandidates(signal) {
         const navUrl = new URL(`${CONFIG.apiBase}/x/web-interface/nav`);
-        const navResponse = await fetch(navUrl, {
-            credentials: 'include',
+        const navJson = await withRequestTimeout(
             signal,
-            headers: { Accept: 'application/json' }
-        });
-        if (!navResponse.ok) throw new Error(`登录信息请求失败（HTTP ${navResponse.status}）`);
-        const navJson = await navResponse.json();
+            async (requestSignal) => {
+                const response = await fetch(navUrl, {
+                    credentials: 'include',
+                    signal: requestSignal,
+                    headers: { Accept: 'application/json' }
+                });
+                if (!response.ok) throw new Error(`登录信息请求失败（HTTP ${response.status}）`);
+                return response.json();
+            },
+            '登录信息请求超时，请稍后重试'
+        );
         if (Number(navJson?.code) !== 0 || !navJson?.data?.isLogin) return [];
 
         const mid = firstString(navJson?.data?.mid);
@@ -1815,16 +1904,23 @@
         url.searchParams.set('ps', '20');
         url.searchParams.set('order', 'desc');
         url.searchParams.set('order_type', 'attention');
-        const response = await fetch(url, {
-            credentials: 'include',
+        const json = await withRequestTimeout(
             signal,
-            headers: { Accept: 'application/json' }
-        });
-        if (!response.ok) throw new Error(`关注列表请求失败（HTTP ${response.status}）`);
-        const json = await response.json();
-        if (Number(json?.code) !== 0) {
-            throw new Error(json?.message || `关注列表请求失败（${json?.code ?? '未知'}）`);
-        }
+            async (requestSignal) => {
+                const response = await fetch(url, {
+                    credentials: 'include',
+                    signal: requestSignal,
+                    headers: { Accept: 'application/json' }
+                });
+                if (!response.ok) throw new Error(`关注列表请求失败（HTTP ${response.status}）`);
+                const value = await response.json();
+                if (Number(value?.code) !== 0) {
+                    throw new Error(value?.message || `关注列表请求失败（${value?.code ?? '未知'}）`);
+                }
+                return value;
+            },
+            '关注列表请求超时，请稍后重试'
+        );
 
         const list = Array.isArray(json?.data?.list) ? json.data.list : [];
         return list.map(createMentionCandidate).filter(Boolean);
@@ -2315,6 +2411,12 @@
         if (id === 'like' || id === 'dislike' || id === 'reply') return id;
 
         const label = nativeReplyActionLabel(element);
+        if (label.includes('dislike') || label.includes('点踩') || label === '踩') {
+            return 'dislike';
+        }
+        if (label.includes('like') || label.includes('点赞') || label === '赞') {
+            return 'like';
+        }
         const tagName = safeString(element.localName).toLowerCase();
         const role = safeString(element.getAttribute?.('role')).toLowerCase();
         const className = safeString(element.getAttribute?.('class')).toLowerCase();
@@ -2330,11 +2432,15 @@
         if (!root?.querySelectorAll || !kind) return null;
         for (const element of root.querySelectorAll('*')) {
             const id = safeString(element.id).toLowerCase();
-            if (id === kind) {
+            if (id === kind || nativeActionKind(element) === kind) {
                 const button = element.localName === 'button'
                     ? element
-                    : element.shadowRoot?.querySelector('button') || element.querySelector?.('button');
-                if (button) return button;
+                    : element.shadowRoot?.querySelector(
+                        'button, [role="button"], a, [tabindex]'
+                    ) || element.querySelector?.(
+                        'button, [role="button"], a, [tabindex]'
+                    ) || element;
+                return button;
             }
             if (element.shadowRoot) {
                 const nested = findNativeActionButton(element.shadowRoot, kind);
@@ -2344,16 +2450,184 @@
         return null;
     }
 
+    function findNativeActionContainer(root, kind) {
+        if (!root?.querySelectorAll || !kind) return null;
+        for (const element of root.querySelectorAll('*')) {
+            if (safeString(element.id).toLowerCase() === kind) return element;
+            if (element.shadowRoot) {
+                const nested = findNativeActionContainer(element.shadowRoot, kind);
+                if (nested) return nested;
+            }
+        }
+        return null;
+    }
+
+    function findNativeDescendant(root, selector) {
+        if (!root) return null;
+        try {
+            const direct = root.querySelector?.(selector);
+            if (direct) return direct;
+        } catch (_) {
+            // 非标准自定义元素查询失败时继续递归。
+        }
+        if (!root.querySelectorAll) return null;
+        for (const element of root.querySelectorAll('*')) {
+            if (!element.shadowRoot) continue;
+            const nested = findNativeDescendant(element.shadowRoot, selector);
+            if (nested) return nested;
+        }
+        return null;
+    }
+
+    function parseDisplayedCount(value) {
+        const text = safeString(value).replace(/,/g, '');
+        const match = text.match(/(\d+(?:\.\d+)?)\s*(万|亿)?/);
+        if (!match) return null;
+        const number = Number(match[1]);
+        if (!Number.isFinite(number)) return null;
+        const multiplier = match[2] === '亿' ? 100000000 : match[2] === '万' ? 10000 : 1;
+        return Math.max(0, Math.round(number * multiplier));
+    }
+
+    function readNativeReplyActionState(host, fallback) {
+        const result = { ...fallback };
+        const likeContainer = findNativeActionContainer(host?.shadowRoot, 'like');
+        const dislikeContainer = findNativeActionContainer(host?.shadowRoot, 'dislike');
+        const likeIcon = findNativeDescendant(likeContainer, 'bili-icon');
+        const dislikeIcon = findNativeDescendant(dislikeContainer, 'bili-icon');
+        const likeIconName = safeString(likeIcon?.getAttribute?.('icon')).toLowerCase();
+        const dislikeIconName = safeString(dislikeIcon?.getAttribute?.('icon')).toLowerCase();
+
+        if (likeIconName.includes('thumbsup_fill')) result.action = 1;
+        else if (dislikeIconName.includes('thumbsdown_fill')) result.action = 2;
+        else if (likeIconName.includes('thumbsup_line') || dislikeIconName.includes('thumbsdown_line')) {
+            result.action = 0;
+        }
+
+        const countElement = findNativeDescendant(likeContainer, '#count');
+        const displayedCount = parseDisplayedCount(countElement?.textContent);
+        if (displayedCount !== null) result.like = displayedCount;
+        return result;
+    }
+
+    function applyNativeReplyActionVisualState(host, reply) {
+        if (!host?.shadowRoot || !reply) return;
+        const likeContainer = findNativeActionContainer(host.shadowRoot, 'like');
+        const dislikeContainer = findNativeActionContainer(host.shadowRoot, 'dislike');
+        const likeIcon = findNativeDescendant(likeContainer, 'bili-icon');
+        const dislikeIcon = findNativeDescendant(dislikeContainer, 'bili-icon');
+        const likeActive = Number(reply.action) === 1;
+        const dislikeActive = Number(reply.action) === 2;
+
+        if (likeIcon) {
+            const icon = likeActive ? 'BDC/hand_thumbsup_fill/2' : 'BDC/hand_thumbsup_line/1';
+            likeIcon.setAttribute('icon', icon);
+            try { likeIcon.icon = icon; } catch (_) { /* 只读属性不影响属性更新。 */ }
+        }
+        if (dislikeIcon) {
+            const icon = dislikeActive ? 'BDC/hand_thumbsdown_fill/2' : 'BDC/hand_thumbsdown_line/1';
+            dislikeIcon.setAttribute('icon', icon);
+            try { dislikeIcon.icon = icon; } catch (_) { /* 只读属性不影响属性更新。 */ }
+        }
+
+        const likeButton = findNativeActionButton(host.shadowRoot, 'like');
+        const dislikeButton = findNativeActionButton(host.shadowRoot, 'dislike');
+        for (const [button, active, label] of [
+            [likeButton, likeActive, likeActive ? '取消点赞' : '点赞'],
+            [dislikeButton, dislikeActive, dislikeActive ? '取消点踩' : '点踩']
+        ]) {
+            if (!button) continue;
+            button.setAttribute?.('aria-pressed', active ? 'true' : 'false');
+            button.setAttribute?.('title', label);
+            button.setAttribute?.('aria-label', label);
+        }
+
+        const countElement = findNativeDescendant(likeContainer, '#count');
+        if (countElement) countElement.textContent = formatCount(reply.like);
+    }
+
+    function syncNativeActionRenderer(host, reply) {
+        if (!host?.shadowRoot || !reply) return;
+        const actionContainer = findNativeActionContainer(host.shadowRoot, 'like')
+            || findNativeActionContainer(host.shadowRoot, 'dislike');
+        const actionRenderer = actionContainer?.getRootNode?.()?.host;
+        if (actionRenderer && actionRenderer !== host) {
+            assignNativeReplyData(actionRenderer, reply);
+            actionRenderer.requestUpdate?.();
+        }
+        host.requestUpdate?.();
+        applyNativeReplyActionVisualState(host, reply);
+        window.queueMicrotask?.(() => applyNativeReplyActionVisualState(host, reply));
+        window.setTimeout(() => applyNativeReplyActionVisualState(host, reply), 80);
+        window.setTimeout(() => applyNativeReplyActionVisualState(host, reply), 240);
+    }
+
     function getPageReplyHost(reply) {
         const rpid = safeString(reply?.rpid);
         if (!rpid) return null;
         const host = state.pageReplyHosts.get(rpid);
         if (host?.isConnected && host.shadowRoot
             && host.getAttribute?.('data-bdv-dialog-native') !== 'true') {
-            return host;
+            try {
+                const current = extractReplyData(host);
+                if (current?.rpid === rpid) return host;
+            } catch (_) {
+                // 组件正在重建时，继续走全树重新定位。
+            }
         }
         state.pageReplyHosts.delete(rpid);
-        return null;
+
+        const found = findPageReplyHostByRpid(rpid);
+        if (found) {
+            state.pageReplyHosts.set(rpid, found);
+            const info = extractReplyData(found);
+            if (info) bindPageReplyActionBridge(found, info);
+        }
+        return found;
+    }
+
+    function findPageReplyHostByRpid(rpid) {
+        const target = safeString(rpid);
+        if (!target) return null;
+        const visited = new Set();
+
+        const visit = (node) => {
+            if (!node || visited.has(node)) return null;
+            visited.add(node);
+
+            if (node.nodeType === Node.ELEMENT_NODE && isReplyHost(node)
+                && node.getAttribute?.('data-bdv-dialog-native') !== 'true') {
+                try {
+                    const info = extractReplyData(node);
+                    if (info?.rpid === target) return node;
+                } catch (_) {
+                    // 单个自定义元素读取失败不影响其它评论节点。
+                }
+            }
+
+            if (node.shadowRoot) {
+                const nested = visit(node.shadowRoot);
+                if (nested) return nested;
+            }
+            if (!node.querySelectorAll) return null;
+            for (const element of node.querySelectorAll('*')) {
+                if (element.shadowRoot) {
+                    const nested = visit(element);
+                    if (nested) return nested;
+                } else if (isReplyHost(element)
+                    && element.getAttribute?.('data-bdv-dialog-native') !== 'true') {
+                    try {
+                        const info = extractReplyData(element);
+                        if (info?.rpid === target) return element;
+                    } catch (_) {
+                        // 继续搜索其它节点。
+                    }
+                }
+            }
+            return null;
+        };
+
+        return visit(document);
     }
 
     function getPageNativeActionButton(reply, kind) {
@@ -2361,24 +2635,150 @@
         return host ? findNativeActionButton(host.shadowRoot, kind) : null;
     }
 
+    function updatePageNativeReply(reply) {
+        const host = getPageReplyHost(reply);
+        if (!host) return false;
+        try {
+            // 备用接口成功时，页面原生 renderer 不会自动收到数据变更。
+            // 将同一份完整评论对象回写给页面实例，并请求它按自己的
+            // Shadow DOM 模板重绘，避免弹窗和页面各维护一份状态。
+            assignNativeReplyData(host, reply);
+            syncNativeActionRenderer(host, reply);
+            return true;
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function writeReplyActionStateToRaw(reply) {
+        if (!isObject(reply?.raw)) return;
+        try {
+            reply.raw.like = reply.like;
+            reply.raw.action = reply.action;
+        } catch (_) {
+            // 只读数据对象不影响弹窗状态更新。
+        }
+    }
+
+    function setReplyActionState(reply, like, action) {
+        if (!reply) return;
+        reply.like = Math.max(0, Number(like) || 0);
+        reply.action = [0, 1, 2].includes(Number(action)) ? Number(action) : 0;
+        writeReplyActionStateToRaw(reply);
+    }
+
     function updateReplyActionState(reply, kind, requestedAction) {
         const previousAction = Number(reply.action) || 0;
         const previousLike = Math.max(0, Number(reply.like) || 0);
+        let nextLike = previousLike;
+        let nextAction = 0;
         if (kind === 'like') {
-            if (requestedAction === 1 && previousAction !== 1) reply.like = previousLike + 1;
-            if (requestedAction === 0 && previousAction === 1) reply.like = Math.max(0, previousLike - 1);
-            reply.action = requestedAction === 1 ? 1 : 0;
+            if (requestedAction === 1 && previousAction !== 1) nextLike = previousLike + 1;
+            if (requestedAction === 0 && previousAction === 1) nextLike = Math.max(0, previousLike - 1);
+            nextAction = requestedAction === 1 ? 1 : 0;
         } else if (kind === 'dislike') {
-            if (requestedAction === 1 && previousAction === 1) reply.like = Math.max(0, previousLike - 1);
-            reply.action = requestedAction === 1 ? 2 : 0;
+            if (requestedAction === 1 && previousAction === 1) nextLike = Math.max(0, previousLike - 1);
+            nextAction = requestedAction === 1 ? 2 : 0;
         }
-        if (isObject(reply.raw)) {
-            try {
-                reply.raw.like = reply.like;
-                reply.raw.action = reply.action;
-            } catch (_) {
-                // 只读数据对象不影响接口操作结果。
-            }
+        setReplyActionState(reply, nextLike, nextAction);
+    }
+
+    function getReplyActionState(reply) {
+        return {
+            action: Number(reply?.action) || 0,
+            like: Math.max(0, Number(reply?.like) || 0)
+        };
+    }
+
+    function restoreReplyActionState(reply, snapshot) {
+        if (!reply || !snapshot) return;
+        setReplyActionState(reply, snapshot.like, snapshot.action);
+    }
+
+    function getRequestedReplyAction(reply, kind) {
+        const currentAction = kind === 'like'
+            ? Number(reply?.action) === 1
+            : Number(reply?.action) === 2;
+        return currentAction ? 0 : 1;
+    }
+
+    function getExpectedReplyAction(kind, requestedAction) {
+        if (kind === 'like') return requestedAction === 1 ? 1 : 0;
+        return requestedAction === 1 ? 2 : 0;
+    }
+
+    function getReplyActionLabel(kind) {
+        return kind === 'like' ? '点赞' : '点踩';
+    }
+
+    function beginReplyInteraction(panel, reply, kind) {
+        if (!panel?.pendingInteractions || !reply?.rpid) return null;
+        if (panel.pendingInteractions.has(reply.rpid)) return null;
+        if (panel.refreshTimer !== null) {
+            window.clearTimeout(panel.refreshTimer);
+            panel.refreshTimer = null;
+        }
+        if (panel.refreshController) {
+            panel.refreshController.abort();
+            panel.refreshController = null;
+        }
+
+        const pending = {
+            rpid: reply.rpid,
+            kind,
+            requestedAction: getRequestedReplyAction(reply, kind),
+            previous: getReplyActionState(reply),
+            attempts: 0,
+            timer: null
+        };
+        pending.expectedAction = getExpectedReplyAction(kind, pending.requestedAction);
+        panel.pendingInteractions.set(reply.rpid, pending);
+
+        // 先更新弹窗里的原生 renderer，避免等待 B 站请求和列表刷新。
+        updateReplyActionState(reply, kind, pending.requestedAction);
+        pending.optimistic = getReplyActionState(reply);
+        updateDialogNativeReply(panel, reply);
+        return pending;
+    }
+
+    function finishReplyInteraction(panel, reply, pending, success, syncPage = success) {
+        if (!panel?.pendingInteractions || !pending) return;
+        if (panel.pendingInteractions.get(pending.rpid) !== pending) return;
+        if (pending.timer !== null) {
+            window.clearTimeout(pending.timer);
+            pending.timer = null;
+        }
+        if (!success) restoreReplyActionState(reply, pending.previous);
+        panel.pendingInteractions.delete(pending.rpid);
+        if (success && syncPage) updatePageNativeReply(reply);
+        updateDialogNativeReply(panel, reply);
+    }
+
+    function mergeFetchedReplyActionState(panel, fetchedReply, pending = null) {
+        const entry = panel?.items?.get(fetchedReply?.rpid);
+        if (!entry?.reply || !fetchedReply) return null;
+        entry.reply.raw = fetchedReply.raw;
+        const keepOptimisticLike = pending
+            && fetchedReply.like === pending.previous.like
+            && pending.optimistic.like !== pending.previous.like;
+        setReplyActionState(
+            entry.reply,
+            keepOptimisticLike ? pending.optimistic.like : fetchedReply.like,
+            fetchedReply.action
+        );
+        updatePageNativeReply(entry.reply);
+        updateDialogNativeReply(panel, entry.reply);
+        return entry.reply;
+    }
+
+    function getPageReplyActionState(reply) {
+        try {
+            const host = getPageReplyHost(reply);
+            const pageReply = host ? extractReplyData(host) : null;
+            if (!pageReply) return null;
+            return readNativeReplyActionState(host, getReplyActionState(pageReply));
+        } catch (_) {
+            return null;
         }
     }
 
@@ -2387,32 +2787,171 @@
         if (entry?.renderer) assignNativeReplyData(entry.renderer, reply);
     }
 
-    function scheduleDialogRefresh(panel, delay = 650) {
-        if (!panel || state.activePanel !== panel) return;
-        if (panel.refreshTimer) window.clearTimeout(panel.refreshTimer);
-        panel.refreshTimer = window.setTimeout(async () => {
+    function getInteractionSyncDelay(pending, fallback = CONFIG.interactionSyncDelaysMs[0]) {
+        if (!pending) return fallback;
+        const delays = CONFIG.interactionSyncDelaysMs;
+        const index = Math.min(Math.max(0, pending.attempts), delays.length - 1);
+        return delays[index] || fallback;
+    }
+
+    function deferUnconfirmedInteraction(panel, pending, message) {
+        const currentReply = panel?.items?.get(pending?.rpid)?.reply;
+        if (!currentReply) {
+            finishReplyInteraction(panel, null, pending, false);
+            showPanelNotice(panel, `${getReplyActionLabel(pending?.kind)}状态未能同步，已恢复原状态`);
+            return;
+        }
+
+        // 页面 renderer 尚未确认时，不把乐观状态写回页面原评论实例，
+        // 避免后续的“复核”又读到脚本自己写入的假状态。
+        finishReplyInteraction(panel, currentReply, pending, true, false);
+        showPanelNotice(panel, message);
+
+        window.setTimeout(() => {
+            if (state.activePanel !== panel || !panel.items.has(pending.rpid)) return;
+            scheduleDialogRefresh(panel, 0, null, pending.rpid);
+        }, CONFIG.interactionDeferredRefreshMs);
+    }
+
+    function scheduleDialogRefresh(
+        panel,
+        delay = CONFIG.interactionSyncDelaysMs[0],
+        pending = null,
+        targetRpid = ''
+    ) {
+        if (!panel || state.activePanel !== panel || !panel.info) return;
+        const effectiveDelay = getInteractionSyncDelay(pending, delay);
+        if (pending?.timer !== null) window.clearTimeout(pending.timer);
+        if (!pending && panel.refreshTimer !== null) {
+            window.clearTimeout(panel.refreshTimer);
             panel.refreshTimer = null;
+        }
+
+        const refresh = async () => {
             if (state.activePanel !== panel || !panel.info) return;
+            if (pending && panel.pendingInteractions.get(pending.rpid) !== pending) return;
+            if (!pending && !targetRpid && panel.pendingInteractions.size) {
+                scheduleDialogRefresh(panel, effectiveDelay, null, targetRpid);
+                return;
+            }
+
+            // 页面中的原生评论通常会先于 dialog 接口更新。优先读取它，
+            // 可以避免等待接口缓存，同时保留 B 站原生按钮的真实操作链路。
+            if (pending) {
+                const pageState = getPageReplyActionState(panel.items.get(pending.rpid)?.reply);
+                if (pageState && pageState.action === pending.expectedAction) {
+                    const currentReply = panel.items.get(pending.rpid)?.reply;
+                    if (currentReply) {
+                        const keepOptimisticLike = pageState.like === pending.previous.like
+                            && pending.optimistic.like !== pending.previous.like;
+                        setReplyActionState(
+                            currentReply,
+                            keepOptimisticLike ? pending.optimistic.like : pageState.like,
+                            pageState.action
+                        );
+                        updateDialogNativeReply(panel, currentReply);
+                    }
+                    finishReplyInteraction(panel, currentReply, pending, true);
+                    return;
+                }
+            }
+
             const controller = new AbortController();
             state.interactionControllers.add(controller);
+            if (!pending) panel.refreshController = controller;
             try {
                 state.dialogCache.delete(dialogCacheKey(panel.info, panel.info.oid));
                 const replies = await fetchAllDialog(panel.info, controller.signal);
-                if (state.activePanel === panel && !controller.signal.aborted) {
+                if (state.activePanel !== panel || controller.signal.aborted) return;
+
+                if (!pending) {
+                    if (targetRpid) {
+                        const fetchedReply = replies.find((item) => item.rpid === targetRpid);
+                        const currentReply = panel.items.get(targetRpid)?.reply;
+                        const pageState = currentReply ? getPageReplyActionState(currentReply) : null;
+                        if (currentReply && pageState && pageState.action === currentReply.action) {
+                            // 页面原生组件已经有更近的状态时，不用可能滞后的
+                            // dialog 响应覆盖它。
+                            setReplyActionState(currentReply, pageState.like, pageState.action);
+                            updateDialogNativeReply(panel, currentReply);
+                        } else if (fetchedReply && currentReply) {
+                            mergeFetchedReplyActionState(panel, fetchedReply);
+                        }
+                        return;
+                    }
+                    // 兼容没有 pending 状态的旧调用方；互动刷新本身不会走这里。
                     renderDialogItems(panel, replies, panel.info);
+                    return;
                 }
+
+                const fetchedReply = replies.find((item) => item.rpid === pending.rpid);
+                const currentReply = panel.items.get(pending.rpid)?.reply;
+                if (panel.pendingInteractions.get(pending.rpid) !== pending) return;
+                if (!currentReply) {
+                    finishReplyInteraction(panel, null, pending, false);
+                    showPanelNotice(panel, `${getReplyActionLabel(pending.kind)}状态未能同步，已恢复原状态`);
+                    return;
+                }
+
+                if (fetchedReply && fetchedReply.action === pending.expectedAction) {
+                    mergeFetchedReplyActionState(panel, fetchedReply, pending);
+                    finishReplyInteraction(panel, currentReply, pending, true);
+                    return;
+                }
+
+                pending.attempts += 1;
+                if (pending.attempts < CONFIG.interactionSyncRetries) {
+                    scheduleDialogRefresh(panel, undefined, pending);
+                    return;
+                }
+
+                // 多次校验仍未得到目标状态时，不能断言原生点击失败：
+                // B 站的页面 renderer 和 dialog 接口可能仍在传播。保留弹窗
+                // 的乐观状态，稍后再做一次不覆盖较新页面状态的复核。
+                deferUnconfirmedInteraction(
+                    panel,
+                    pending,
+                    `${getReplyActionLabel(pending.kind)}状态暂未确认，已保留当前显示，稍后自动复核`
+                );
             } catch (_) {
-                // 原生按钮已经完成了页面侧操作；刷新失败时保留当前列表。
+                if (pending && panel.pendingInteractions.get(pending.rpid) === pending) {
+                    pending.attempts += 1;
+                    if (pending.attempts < CONFIG.interactionSyncRetries) {
+                        scheduleDialogRefresh(panel, undefined, pending);
+                    } else {
+                        deferUnconfirmedInteraction(
+                            panel,
+                            pending,
+                            `${getReplyActionLabel(pending.kind)}状态暂未确认，已保留当前显示，稍后自动复核`
+                        );
+                    }
+                }
+                // 背景校验失败时不打断已经发出的原生操作。
             } finally {
                 state.interactionControllers.delete(controller);
+                if (!pending && panel.refreshController === controller) {
+                    panel.refreshController = null;
+                }
             }
-        }, delay);
+        };
+
+        if (pending) {
+            pending.timer = window.setTimeout(() => {
+                pending.timer = null;
+                refresh();
+            }, effectiveDelay);
+        } else {
+            panel.refreshTimer = window.setTimeout(() => {
+                panel.refreshTimer = null;
+                refresh();
+            }, delay);
+        }
     }
 
-    async function fallbackDialogAction(panel, reply, kind) {
+    async function fallbackDialogAction(panel, reply, kind, pending = null) {
         if (!panel?.info || !reply || (kind !== 'like' && kind !== 'dislike')) return;
-        const currentAction = kind === 'like' ? Number(reply.action) === 1 : Number(reply.action) === 2;
-        const requestedAction = currentAction ? 0 : 1;
+        const interaction = pending || beginReplyInteraction(panel, reply, kind);
+        if (!interaction) return;
         const controller = new AbortController();
         state.interactionControllers.add(controller);
         try {
@@ -2421,14 +2960,18 @@
             const oid = await resolveOid(info, controller.signal);
             await postForm(
                 kind === 'like' ? '/x/v2/reply/action' : '/x/v2/reply/hate',
-                { type, oid, rpid: reply.rpid, action: requestedAction },
+                { type, oid, rpid: reply.rpid, action: interaction.requestedAction },
                 controller.signal
             );
-            updateReplyActionState(reply, kind, requestedAction);
-            updateDialogNativeReply(panel, reply);
+            finishReplyInteraction(panel, reply, interaction, true);
+            // 操作接口通常只返回 code，不返回最新点赞数；成功后重新拉取该
+            // 评论，避免乐观数量与服务器最终状态长期不一致。
+            scheduleDialogRefresh(panel, CONFIG.interactionSyncDelaysMs[0], null, reply.rpid);
             showPanelNotice(panel, kind === 'like' ? '点赞状态已更新' : '点踩状态已更新');
         } catch (error) {
-            if (!controller.signal.aborted && state.activePanel === panel) {
+            if (state.activePanel === panel
+                && panel.pendingInteractions?.get(interaction.rpid) === interaction) {
+                finishReplyInteraction(panel, reply, interaction, false);
                 showPanelNotice(panel, error?.message || '评论操作失败');
             }
         } finally {
@@ -2455,12 +2998,19 @@
             }
 
             const pageButton = getPageNativeActionButton(reply, kind);
+            const pending = beginReplyInteraction(panel, reply, kind);
+            if (!pending) return;
             if (pageButton) {
-                pageButton.click();
-                scheduleDialogRefresh(panel);
+                try {
+                    pageButton.click();
+                    scheduleDialogRefresh(panel, undefined, pending);
+                } catch (error) {
+                    finishReplyInteraction(panel, reply, pending, false);
+                    showPanelNotice(panel, error?.message || '评论操作失败');
+                }
                 return;
             }
-            fallbackDialogAction(panel, reply, kind);
+            fallbackDialogAction(panel, reply, kind, pending);
         }, true);
     }
 
@@ -2577,8 +3127,10 @@
             info: null,
             replies: [],
             items: new Map(),
+            pendingInteractions: new Map(),
             composer: null,
-            refreshTimer: null
+            refreshTimer: null,
+            refreshController: null
         };
         panelState.composer = createReplyComposer(panelState);
         panel.appendChild(panelState.composer.container);
@@ -2599,6 +3151,11 @@
             window.clearTimeout(state.activePanel.refreshTimer);
             state.activePanel.refreshTimer = null;
         }
+        for (const pending of state.activePanel?.pendingInteractions?.values() || []) {
+            if (pending.timer !== null) window.clearTimeout(pending.timer);
+            pending.timer = null;
+        }
+        state.activePanel?.pendingInteractions?.clear();
         if (state.activeAbortController) {
             state.activeAbortController.abort();
             state.activeAbortController = null;
@@ -2636,14 +3193,23 @@
 
         const url = new URL(`${CONFIG.apiBase}/x/web-interface/view`);
         url.searchParams.set('bvid', bvid);
-        const response = await fetch(url, {
-            credentials: 'include',
+        const data = await withRequestTimeout(
             signal,
-            headers: { Accept: 'application/json' }
-        });
-        if (!response.ok) throw new Error(`视频信息请求失败（HTTP ${response.status}）`);
-        const data = await response.json();
-        if (Number(data?.code) !== 0) throw new Error(data?.message || '无法获取视频 AID');
+            async (requestSignal) => {
+                const response = await fetch(url, {
+                    credentials: 'include',
+                    signal: requestSignal,
+                    headers: { Accept: 'application/json' }
+                });
+                if (!response.ok) throw new Error(`视频信息请求失败（HTTP ${response.status}）`);
+                const value = await response.json();
+                if (Number(value?.code) !== 0) {
+                    throw new Error(value?.message || '无法获取视频 AID');
+                }
+                return value;
+            },
+            '视频信息请求超时，请稍后重试'
+        );
         return firstString(data?.data?.aid);
     }
 
@@ -2685,22 +3251,25 @@
         }
         form.set('csrf', csrf);
 
-        const response = await fetch(`${CONFIG.apiBase}${path}`, {
-            method: 'POST',
-            credentials: 'include',
-            signal,
-            headers: {
-                Accept: 'application/json',
-                'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'
-            },
-            body: form.toString()
-        });
-        if (!response.ok) throw new Error(`评论操作失败（HTTP ${response.status}）`);
-        const json = await response.json();
-        if (Number(json?.code) !== 0) {
-            throw new Error(json?.message || `评论操作失败（${json?.code ?? '未知'}）`);
-        }
-        return json;
+        return withRequestTimeout(signal, async (requestSignal) => {
+            const response = await fetch(`${CONFIG.apiBase}${path}`, {
+                method: 'POST',
+                credentials: 'include',
+                signal: requestSignal,
+                cache: 'no-store',
+                headers: {
+                    Accept: 'application/json',
+                    'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'
+                },
+                body: form.toString()
+            });
+            if (!response.ok) throw new Error(`评论操作失败（HTTP ${response.status}）`);
+            const json = await response.json();
+            if (Number(json?.code) !== 0) {
+                throw new Error(json?.message || `评论操作失败（${json?.code ?? '未知'}）`);
+            }
+            return json;
+        }, '评论操作超时，请稍后重试');
     }
 
     function dialogCacheKey(info, oid) {
@@ -2784,32 +3353,26 @@
         url.searchParams.set('size', String(CONFIG.pageSize));
         url.searchParams.set('min_floor', String(minFloor));
 
-        const timeoutController = new AbortController();
-        const timeoutId = window.setTimeout(() => timeoutController.abort(), CONFIG.requestTimeoutMs);
-        const abortForwarder = () => timeoutController.abort();
-        if (signal?.aborted) timeoutController.abort();
-        signal?.addEventListener('abort', abortForwarder, { once: true });
-
         try {
-            const response = await fetch(url, {
-                credentials: 'include',
-                signal: timeoutController.signal,
-                headers: { Accept: 'application/json' }
-            });
-            if (!response.ok) throw new Error(`对话请求失败（HTTP ${response.status}）`);
-            const json = await response.json();
-            if (Number(json?.code) !== 0) {
-                throw new Error(json?.message || `对话接口返回错误（${json?.code ?? '未知'}）`);
-            }
-            return json.data || {};
+            return await withRequestTimeout(signal, async (requestSignal) => {
+                const response = await fetch(url, {
+                    credentials: 'include',
+                    signal: requestSignal,
+                    cache: 'no-store',
+                    headers: { Accept: 'application/json' }
+                });
+                if (!response.ok) throw new Error(`对话请求失败（HTTP ${response.status}）`);
+                const json = await response.json();
+                if (Number(json?.code) !== 0) {
+                    throw new Error(json?.message || `对话接口返回错误（${json?.code ?? '未知'}）`);
+                }
+                return json.data || {};
+            }, '对话请求超时，请稍后重试');
         } catch (error) {
             if (error?.name === 'AbortError') {
                 throw new Error('对话请求超时或已取消');
             }
             throw error;
-        } finally {
-            window.clearTimeout(timeoutId);
-            signal?.removeEventListener('abort', abortForwarder);
         }
     }
 
