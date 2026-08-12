@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         bilibili类原生查看对话
 // @namespace    https://github.com/nsdd/bilibili-native-dialog
-// @version      0.5.9
+// @version      0.5.10
 // @author       luolisama
 // @downloadURL  https://github.com/luolisama/bilibili-native-dialog/raw/refs/heads/main/bilibili-native-dialog.user.js?download=1
 // @updateURL    https://github.com/luolisama/bilibili-native-dialog/raw/refs/heads/main/bilibili-native-dialog.user.js?download=1
@@ -2168,7 +2168,11 @@
         if (!isObject(raw.content)) raw.content = reply.content || {};
         if (!isObject(raw.reply_control)) {
             raw.reply_control = {};
-            if (reply.location) raw.reply_control.location = reply.location;
+        }
+        if (reply.location && !firstString(raw.reply_control.location)) {
+            // IP 属地插件读取的是 reply_control.location，不能只保留在
+            // 规范化对象上，否则独立的原生 renderer 看不到这个字段。
+            raw.reply_control.location = reply.location;
         }
         for (const key of ['rpid', 'root', 'parent', 'dialog', 'oid', 'type', 'mid', 'ctime', 'like', 'action']) {
             if (raw[key] === undefined && reply[key] !== undefined) raw[key] = reply[key];
@@ -2211,6 +2215,84 @@
         } catch (_) {
             // Lit 版本没有暴露 requestUpdate 时由属性 setter 自己触发更新。
         }
+    }
+
+    function getReplyLocation(reply) {
+        const raw = isObject(reply?.raw) ? reply.raw : reply;
+        return firstString(
+            reply?.location,
+            raw?.reply_control?.location,
+            raw?.location
+        );
+    }
+
+    function findNativePubdate(renderer) {
+        const root = renderer?.shadowRoot;
+        if (!root) return null;
+
+        // 兼容 B 站不同版本：部分版本把 #pubdate 放在 action renderer
+        // 的 ShadowRoot，旧版本可能直接放在 reply renderer 内。
+        const direct = root.querySelector('#pubdate');
+        if (direct) return direct;
+        const actionRenderer = root.querySelector(
+            '#footer > bili-comment-action-buttons-renderer, #footer bili-comment-action-buttons-renderer'
+        );
+        return actionRenderer?.shadowRoot?.querySelector('#pubdate') || null;
+    }
+
+    function applyNativeIpLocation(renderer, reply) {
+        const location = getReplyLocation(reply);
+        if (!location) return true;
+
+        const pubdate = findNativePubdate(renderer);
+        if (!pubdate) return false;
+
+        let locationElement = pubdate.querySelector('.ip-location');
+        if (!locationElement) {
+            locationElement = document.createElement('span');
+            locationElement.className = 'ip-location';
+            // 与 Bilibili Evolved 的 IP 属地组件保持同一 class 和间距，
+            // 让它已有的样式可以直接接管，不重复造一套评论样式。
+            locationElement.style.marginLeft = '15px';
+            pubdate.appendChild(locationElement);
+        }
+        locationElement.textContent = location;
+        return true;
+    }
+
+    function scheduleNativeIpLocation(renderer, reply) {
+        if (!renderer || renderer.dataset.bdvIpLocationBridge === 'true') return;
+        renderer.dataset.bdvIpLocationBridge = 'true';
+
+        let attempts = 0;
+        let timer = null;
+        let observer = null;
+        const cleanup = () => {
+            if (timer !== null) window.clearTimeout(timer);
+            observer?.disconnect();
+            timer = null;
+            observer = null;
+        };
+        const attempt = () => {
+            if (!renderer.isConnected || applyNativeIpLocation(renderer, reply)) {
+                cleanup();
+                return;
+            }
+            attempts += 1;
+            if (attempts >= 30) {
+                cleanup();
+                return;
+            }
+            timer = window.setTimeout(attempt, 100);
+        };
+
+        // 组件的外层 ShadowRoot 和 action renderer 的内部 ShadowRoot
+        // 都可能异步创建；定时重试与 Bilibili Evolved 的 select 重试窗口一致。
+        if (renderer.shadowRoot) {
+            observer = new MutationObserver(attempt);
+            observer.observe(renderer.shadowRoot, { childList: true, subtree: true });
+        }
+        queueMicrotask(attempt);
     }
 
     function nativeReplyRendererAvailable() {
@@ -2394,11 +2476,15 @@
         renderer.setAttribute('data-bdv-dialog-native', 'true');
         assignNativeReplyData(renderer, reply);
         bindNativeReplyAction(panel, reply, renderer);
+        scheduleNativeIpLocation(renderer, reply);
 
         // 组件升级/首次 Lit 更新的时序在不同页面不完全一致，升级后再写一次
         // 数据可以覆盖“先创建、后注册”的版本，同时仍然只使用原生渲染。
         const refresh = () => {
-            if (renderer.isConnected) assignNativeReplyData(renderer, reply);
+            if (renderer.isConnected) {
+                assignNativeReplyData(renderer, reply);
+                applyNativeIpLocation(renderer, reply);
+            }
         };
         queueMicrotask(refresh);
         window.setTimeout(refresh, 0);
