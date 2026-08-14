@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         bilibili类原生查看对话
 // @namespace    https://github.com/luolisama/bilibili-native-dialog
-// @version      0.5.11
+// @version      0.5.12
 // @author       luolisama
 // @downloadURL  https://github.com/luolisama/bilibili-native-dialog/raw/refs/heads/main/bilibili-native-dialog.user.js?download=1
 // @updateURL    https://github.com/luolisama/bilibili-native-dialog/raw/refs/heads/main/bilibili-native-dialog.user.js?download=1
